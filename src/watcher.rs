@@ -19,11 +19,28 @@ pub fn spawn(path: PathBuf, engine: Engine) {
     // 使用阻塞线程持有watcher，避免异步生命周期问题。 / Use blocking thread to hold watcher, avoiding async lifetime issues.
     thread::spawn(move || {
         let result = run_files_watcher(std::slice::from_ref(&path), || {
-            if let Some(new_cfg) = load_with_retry("config", || {
-                config::load_config(&path).and_then(RuntimePipelineConfig::from_config)
-            }) {
-                engine.reload(new_cfg);
-                info!(target = "watcher", path = %path.display(), "config reloaded");
+            // The final error is only kept for the observer / 仅为观察者保留最终错误
+            let observed = engine.observer().is_some();
+            let mut last_error = None;
+            let loaded = load_with_retry("config", || {
+                let result = config::load_config_with_source(&path).and_then(|(cfg, raw)| {
+                    RuntimePipelineConfig::from_config(cfg).map(|cfg| (cfg, raw))
+                });
+                if observed && let Err(err) = &result {
+                    last_error = Some(format!("{err:#}"));
+                }
+                result
+            });
+            match loaded {
+                Some((new_cfg, raw)) => {
+                    engine.reload(new_cfg);
+                    engine.notify_config_loaded(&path, &raw);
+                    info!(target = "watcher", path = %path.display(), "config reloaded");
+                }
+                None => engine.notify_config_reload_failed(
+                    &path,
+                    last_error.as_deref().unwrap_or("config reload failed"),
+                ),
             }
         });
         if let Err(err) = result {

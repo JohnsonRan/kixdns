@@ -825,14 +825,30 @@ fn default_match_operator() -> MatchOperator {
 }
 
 pub fn load_config(path: &Path) -> Result<PipelineConfig> {
+    load_config_with_source(path).map(|(cfg, _)| cfg)
+}
+
+/// Load the configuration file at `path` and return it together with the
+/// text it was parsed from, so callers can fingerprint the active
+/// configuration. / 加载配置文件并连同原始文本一起返回，便于调用方计算指纹。
+pub fn load_config_with_source(path: &Path) -> Result<(PipelineConfig, String)> {
     let raw = fs::read_to_string(path)
         .with_context(|| format!("read config file: {}", path.display()))?;
-    let mut cfg: PipelineConfig = serde_json::from_str(&raw)
-        .with_context(|| format!("parse config file: {}", path.display()))?;
+    let cfg =
+        parse_config(&raw).with_context(|| format!("parse config file: {}", path.display()))?;
 
     if let Some(version) = cfg.version.as_ref() {
         info!(target = "config", version = %version, "config loaded");
     }
+
+    Ok((cfg, raw))
+}
+
+/// Parse and normalize a configuration from its JSON text without touching
+/// the filesystem. Errors from the JSON layer carry line/column positions.
+/// 从 JSON 文本解析并规范化配置，不访问文件系统。JSON 层错误带行列位置。
+pub fn parse_config(raw: &str) -> Result<PipelineConfig> {
+    let mut cfg: PipelineConfig = serde_json::from_str(raw).context("parse config JSON")?;
 
     // 轻量校验：CIDR提前解析，便于后续快速匹配。 / Lightweight validation: parse CIDR in advance for subsequent fast matching
     // 预分割 upstream 字符串以提高性能 / Pre-split upstream strings for better performance

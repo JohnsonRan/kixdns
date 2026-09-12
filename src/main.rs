@@ -10,7 +10,7 @@ use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tracing::{debug, error, info, warn};
 use tracing_subscriber::{EnvFilter, fmt, layer::SubscriberExt, util::SubscriberInitExt};
 
-use kixdns::config::load_config;
+use kixdns::config::load_config_with_source;
 use kixdns::engine::{Engine, FastPathResponse, PreParsedData, engine_helpers};
 use kixdns::matcher::RuntimePipelineConfig;
 use kixdns::proto_utils::{is_standard_query_header, truncate_udp_response};
@@ -123,7 +123,7 @@ async fn run_dns_server(
         .install_default()
         .map_err(|_| anyhow::anyhow!("failed to install rustls crypto provider"))?;
 
-    let cfg = load_config(&config).context("load initial config")?;
+    let (cfg, config_source) = load_config_with_source(&config).context("load initial config")?;
     let cfg = RuntimePipelineConfig::from_config(cfg).context("compile matchers")?;
     let bind_addr: SocketAddr = cfg.settings.bind_udp.parse().context("parse bind addr")?;
     let bind_tcp: SocketAddr = cfg
@@ -156,6 +156,8 @@ async fn run_dns_server(
         };
 
     let engine = Engine::new(cfg, listener_label.clone()).context("initialize DNS engine")?;
+    engine.notify_config_loaded(&config, &config_source);
+    drop(config_source);
 
     watcher::spawn(config.clone(), engine.clone());
 
