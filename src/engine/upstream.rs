@@ -10,6 +10,7 @@ use tracing::debug;
 
 use super::Engine;
 use crate::config::Transport;
+use crate::observe::{RequestContext, UpstreamAttempt, UpstreamOutcome, UpstreamResult};
 
 /// Error indicating that all upstream attempts have been exhausted.
 /// 表示所有 upstream 尝试均已耗尽的错误。
@@ -230,6 +231,9 @@ const DEFAULT_HEDGE_TIMEOUT_MS: u64 = 100;
 ///
 /// Returns the first successful response and the name of the winning upstream.
 /// 返回第一个成功的响应和获胜的上游名称。
+///
+/// `observed` is the observer context of the request; every attempt and its
+/// result is reported through it. / `observed` 为所属请求的观察者上下文，每次尝试及其结果都经它上报。
 pub async fn forward_upstream(
     engine: &Engine,
     packet: &[u8],
@@ -237,9 +241,12 @@ pub async fn forward_upstream(
     timeout_dur: Duration,
     transport: Option<Transport>,
     pre_split_upstreams: Option<&std::sync::Arc<Vec<std::sync::Arc<str>>>>,
+    observed: Option<&RequestContext<'_>>,
 ) -> anyhow::Result<(Bytes, String)> {
     // 如果 transport 为 None，使用默认 UDP
     let default_transport = transport.unwrap_or(Transport::Udp);
+    // One observer check for the whole call / 整个调用只做一次观察者检查
+    let observed = engine.observer.as_deref().zip(observed);
 
     // 使用预分割数据或动态分割 / Use pre-split data or dynamic splitting
     // 使用 Arc<str> 避免克隆 / Use Arc<str> to avoid cloning
@@ -264,6 +271,15 @@ pub async fn forward_upstream(
 
         // 解析地址中的协议前缀 / Parse protocol prefix from address
         let (addr, transport_for_addr) = parse_upstream_addr(up, default_transport);
+        if let Some((observer, ctx)) = observed {
+            observer.upstream_attempt(
+                ctx,
+                &UpstreamAttempt {
+                    upstream: addr,
+                    transport: transport_for_addr,
+                },
+            );
+        }
 
         let start = std::time::Instant::now();
         let (res, proto): (anyhow::Result<Bytes>, &str) = match transport_for_addr {
@@ -302,6 +318,18 @@ pub async fn forward_upstream(
 
         match res {
             Ok(ref bytes) => {
+                if let Some((observer, ctx)) = observed {
+                    observer.upstream_result(
+                        ctx,
+                        &UpstreamResult {
+                            upstream: addr,
+                            transport: transport_for_addr,
+                            outcome: UpstreamOutcome::Success,
+                            latency: dur,
+                            error: None,
+                        },
+                    );
+                }
                 // 记录成功指标 / Record success metrics
                 // Increment upstream metrics - 原子操作
                 engine
@@ -321,6 +349,18 @@ pub async fn forward_upstream(
                 return Ok((bytes.clone(), upstream_with_proto));
             }
             Err(err) => {
+                if let Some((observer, ctx)) = observed {
+                    observer.upstream_result(
+                        ctx,
+                        &UpstreamResult {
+                            upstream: addr,
+                            transport: transport_for_addr,
+                            outcome: UpstreamOutcome::Error,
+                            latency: dur,
+                            error: Some(&err),
+                        },
+                    );
+                }
                 // 失败时不构造 prefix，只 warn
                 tracing::warn!(upstream=%up, error=%err, elapsed_ns = dur.as_nanos() as u64, "single upstream call failed");
                 return Err(anyhow::Error::new(UpstreamFailure::new(err)));
@@ -346,6 +386,15 @@ pub async fn forward_upstream(
     for up in upstreams {
         // 解析地址中的协议前缀 / Parse protocol prefix from address
         let (addr, transport_for_task) = parse_upstream_addr(&up, default_transport);
+        if let Some((observer, ctx)) = observed {
+            observer.upstream_attempt(
+                ctx,
+                &UpstreamAttempt {
+                    upstream: addr,
+                    transport: transport_for_task,
+                },
+            );
+        }
 
         let engine = engine.clone();
         let packet = packet_owned.clone();
@@ -401,14 +450,35 @@ pub async fn forward_upstream(
             // 注意：对于 TcpUdp，计时包含两个任务的 spawn/abort 开销
             let upstream_with_proto = format!("{}:{}", proto, addr_owned);
             let dur = start.elapsed();
-            (upstream_with_proto, res, dur)
+            (
+                upstream_with_proto,
+                addr_owned,
+                transport_for_task,
+                res,
+                dur,
+            )
         });
     }
 
     // 等待第一个成功响应 / Wait for first successful response
     while let Some(result) = tasks.join_next().await {
         match result {
-            Ok((up_proto, res, dur)) => {
+            Ok((up_proto, addr, transport_for_task, res, dur)) => {
+                // Report the outcome of this attempt / 上报本次尝试的结果
+                let report = |outcome: UpstreamOutcome, error: Option<&anyhow::Error>| {
+                    if let Some((observer, ctx)) = observed {
+                        observer.upstream_result(
+                            ctx,
+                            &UpstreamResult {
+                                upstream: &addr,
+                                transport: transport_for_task,
+                                outcome,
+                                latency: dur,
+                                error,
+                            },
+                        );
+                    }
+                };
                 match res {
                     Ok(bytes) => {
                         // 快速解析响应码 / Quick parse response code
@@ -424,6 +494,7 @@ pub async fn forward_upstream(
                             };
 
                         if should_accept {
+                            report(UpstreamOutcome::Success, None);
                             engine
                                 .metrics_upstream_calls
                                 .fetch_add(1, Ordering::Relaxed);
@@ -441,8 +512,10 @@ pub async fn forward_upstream(
 
                             return Ok((bytes, up_proto));
                         }
+                        report(UpstreamOutcome::Rejected, None);
                     }
                     Err(err) => {
+                        report(UpstreamOutcome::Error, Some(&err));
                         tracing::warn!(upstream=%up_proto, error=%err, elapsed_ns = dur.as_nanos() as u64, "upstream call failed, waiting for others");
                         last_err = Some(err);
                     }

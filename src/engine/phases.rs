@@ -577,6 +577,7 @@ pub async fn handle_forward_decision(
                 upstream_timeout,
                 transport,
                 pre_split_upstreams,
+                observed,
             )
             .await
         }
@@ -625,6 +626,7 @@ pub async fn handle_forward_decision(
             upstream_timeout,
             transport,
             pre_split_upstreams,
+            observed,
         )
         .await
     };
@@ -682,6 +684,7 @@ pub async fn handle_forward_decision(
                     upstream_timeout,
                     Some(Transport::Tcp),
                     pre_split_upstreams,
+                    observed,
                 )
                 .await?;
                 if let Some(guard) = cleanup_guard.as_mut() {
@@ -852,7 +855,7 @@ pub async fn handle_forward_decision(
                 remaining_jumps: response_jump_limit,
             };
 
-            let action_result = rules::apply_response_actions(ctx).await?;
+            let action_result = rules::apply_response_actions_observed(ctx, observed).await?;
 
             match action_result {
                 ResponseActionResult::Upstream { ctx, resp_match: _ } => {
@@ -1079,7 +1082,7 @@ pub async fn handle_forward_decision(
                     rule_name,
                     remaining_jumps: response_jump_limit,
                 };
-                let action_result = rules::apply_response_actions(ctx).await?;
+                let action_result = rules::apply_response_actions_observed(ctx, observed).await?;
 
                 match action_result {
                     ResponseActionResult::Upstream { ctx, resp_match: _ } => {

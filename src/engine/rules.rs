@@ -267,8 +267,20 @@ pub struct ApplyResponseActionsContext<'a> {
     pub remaining_jumps: usize,
 }
 
+/// Test-only shorthand for [`apply_response_actions_observed`] without an observer context.
+#[cfg(test)]
 pub(crate) async fn apply_response_actions(
+    ctx: ApplyResponseActionsContext<'_>,
+) -> anyhow::Result<ResponseActionResult> {
+    apply_response_actions_observed(ctx, None).await
+}
+
+/// [`apply_response_actions`] with the observer context of the request, so
+/// upstream attempts made by response-phase `forward` actions are reported.
+/// 带观察者上下文的 [`apply_response_actions`]，使响应阶段 forward 动作的上游尝试得以上报。
+pub(crate) async fn apply_response_actions_observed(
     mut ctx: ApplyResponseActionsContext<'_>,
+    observed: Option<&RequestContext<'_>>,
 ) -> anyhow::Result<ResponseActionResult> {
     const MAX_RESPONSE_FORWARDS: usize = 4;
     let mut forward_attempts = 0usize;
@@ -450,6 +462,7 @@ pub(crate) async fn apply_response_actions(
                     ctx.upstream_timeout,
                     Some(use_transport),
                     pre_split_upstreams.as_ref(),
+                    observed,
                 )
                 .await
                 {
@@ -829,6 +842,7 @@ pub(crate) async fn process_response_jump(
                             upstream_timeout,
                             transport,
                             pre_split_upstreams.as_ref(),
+                            observed,
                         )
                         .await
                     }
@@ -906,6 +920,7 @@ pub(crate) async fn process_response_jump(
                         upstream_timeout,
                         transport,
                         pre_split_upstreams.as_ref(),
+                        observed,
                     )
                     .await
                 };
@@ -1041,7 +1056,8 @@ pub(crate) async fn process_response_jump(
                             rule_name: &rule_name,
                             remaining_jumps,
                         };
-                        let action_result = apply_response_actions(apply_ctx).await?;
+                        let action_result =
+                            apply_response_actions_observed(apply_ctx, observed).await?;
 
                         match action_result {
                             ResponseActionResult::Upstream { ctx, resp_match } => {
