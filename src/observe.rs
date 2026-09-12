@@ -21,6 +21,23 @@
 //!
 //! [`NoopObserver`] is the "no hooks" implementation and [`TracingObserver`]
 //! is a reference implementation that forwards every event to `tracing`.
+//!
+//! ```no_run
+//! use std::sync::Arc;
+//! use kixdns::engine::Engine;
+//! use kixdns::observe::TracingObserver;
+//!
+//! # fn main() -> anyhow::Result<()> {
+//! let cfg = kixdns::config::parse_config(r#"{ "pipelines": [] }"#)?;
+//! let cfg = kixdns::matcher::RuntimePipelineConfig::from_config(cfg)?;
+//! let engine = Engine::builder(cfg)
+//!     .listener_label("default")
+//!     .observer(Arc::new(TracingObserver))
+//!     .build()?;
+//! assert!(engine.observer().is_some());
+//! # Ok(())
+//! # }
+//! ```
 
 use std::net::SocketAddr;
 use std::path::Path;
