@@ -23,9 +23,14 @@ use tracing::warn;
 use crate::cache::CacheEntry;
 use crate::config::Transport;
 use crate::matcher::RuntimePipelineConfig;
-use crate::matcher::advanced_rule::{compile_pipelines, fast_static_match};
+use crate::matcher::advanced_rule::{compile_pipelines, fast_static_match_with_rule};
+use crate::observe::{
+    CacheHitKind, DecisionKind, EngineObserver, RequestContext, RequestOutcome, RequestStatus,
+    RuleMatched, RulePhase,
+};
 use crate::proto_utils::parse_quick;
 
+use super::observation::{ObservedRequest, report_matched_rules};
 use super::response::build_fast_static_response;
 use super::types::{EngineInner, FastPathResponse, build_cache_namespaces};
 use super::utils::{engine_helpers, is_refreshing};
@@ -67,6 +72,20 @@ impl PreParsedData {
             ecs_key,
         }
     }
+}
+
+/// What answered a request on the synchronous fast path, for observer reporting.
+/// 快速路径上应答请求的来源，用于观察者上报。
+enum FastPathAnswer<'a> {
+    /// Fresh response cache entry / 新鲜的响应缓存条目
+    Cache,
+    /// Compiled static rule matched directly / 编译后的静态规则直接命中
+    StaticRule(&'a str),
+    /// Rule cache entry holding a static decision / 规则缓存中的静态决策
+    CachedRules {
+        rules: &'a [Arc<str>],
+        deciding: Option<DecisionKind>,
+    },
 }
 
 // ============================================================================
@@ -251,6 +270,65 @@ impl Engine {
         self.cache.insert(cache_hash, Arc::new(entry));
     }
 
+    /// Observer context for a request answered on the fast path.
+    /// 快速路径应答请求的观察者上下文。
+    fn fast_path_context<'a>(
+        &'a self,
+        peer: SocketAddr,
+        qname: &'a str,
+        qtype: hickory_proto::rr::RecordType,
+        qclass: DNSClass,
+    ) -> RequestContext<'a> {
+        RequestContext {
+            request_id: self.request_id_counter.fetch_add(1, Ordering::Relaxed),
+            listener_label: &self.listener_label,
+            client: peer,
+            qname,
+            qtype,
+            qclass,
+            background_refresh: false,
+        }
+    }
+
+    /// Report a request that `handle_packet_fast` answered without the async
+    /// path: the whole lifecycle is emitted in one batch at the answering site.
+    /// 上报由 handle_packet_fast 直接应答的请求：整个生命周期在应答处一次性上报。
+    fn observe_fast_path(
+        &self,
+        observer: &dyn EngineObserver,
+        start: Instant,
+        ctx: &RequestContext<'_>,
+        pipeline_id: &str,
+        answer: FastPathAnswer<'_>,
+    ) {
+        observer.request_started(ctx);
+        observer.pipeline_selected(ctx, pipeline_id);
+        observer.cache_lookup(ctx);
+        match answer {
+            FastPathAnswer::Cache => observer.cache_hit(ctx, CacheHitKind::Fresh),
+            FastPathAnswer::StaticRule(rule) => observer.rule_matched(
+                ctx,
+                &RuleMatched {
+                    pipeline: pipeline_id,
+                    rule,
+                    phase: RulePhase::Request,
+                    decision: DecisionKind::Static,
+                    fast_path: true,
+                },
+            ),
+            FastPathAnswer::CachedRules { rules, deciding } => {
+                report_matched_rules(observer, ctx, pipeline_id, rules, deciding, true)
+            }
+        }
+        observer.request_finished(
+            ctx,
+            &RequestOutcome {
+                latency: start.elapsed(),
+                status: RequestStatus::Completed,
+            },
+        );
+    }
+
     #[allow(dead_code)]
     pub fn metrics_snapshot(&self) -> String {
         let inflight = self.metrics_inflight.load(Ordering::Relaxed);
@@ -291,6 +369,13 @@ impl Engine {
         };
         // Count incoming quick-parsed requests / 计数进入的快速解析请求
         self.incr_total_requests();
+        // Observer: requests answered here are reported in one batch at the
+        // answering site; requests that fall through are reported by the async path.
+        // 观察者：在此应答的请求在应答处一次性上报；回落的请求由异步路径上报。
+        let observed = self
+            .observer
+            .as_deref()
+            .map(|observer| (observer, Instant::now()));
 
         // Get pipeline ID / 获取 pipeline ID
         let state = self.state.load_full();
@@ -417,6 +502,15 @@ impl Engine {
                     // Next query will automatically use refreshed new cache (if completed)
                     // 下次查询时会自动使用刷新后的新缓存（如果已完成）
                     self.incr_fastpath_hits();
+                    if let Some((observer, start)) = observed {
+                        self.observe_fast_path(
+                            observer,
+                            start,
+                            &self.fast_path_context(peer, qname_str, qtype, qclass),
+                            &pipeline_id,
+                            FastPathAnswer::Cache,
+                        );
+                    }
                     return Ok(Some(FastPathResponse::CacheHit {
                         cached: hit.bytes.clone(),
                         tx_id: q.tx_id,
@@ -430,18 +524,29 @@ impl Engine {
         if let Some(compiled) = self.compiled_for(&state, &pipeline_id) {
             let qclass = DNSClass::from(q.qclass);
             let qname_str = q.qname_str_unchecked(); // Zero-allocation / 零分配
-            if let Some(Decision::Static { rcode, answers }) = fast_static_match(
-                compiled,
-                qname_str,
-                qtype,
-                qclass,
-                peer.ip(),
-                q.edns_present,
-            ) {
+            if let Some((Decision::Static { rcode, answers }, rule_name)) =
+                fast_static_match_with_rule(
+                    compiled,
+                    qname_str,
+                    qtype,
+                    qclass,
+                    peer.ip(),
+                    q.edns_present,
+                )
+            {
                 let resp = build_fast_static_response(
                     q.tx_id, qname_str, q.qtype, q.qclass, rcode, &answers,
                 )?;
                 self.incr_fastpath_hits();
+                if let Some((observer, start)) = observed {
+                    self.observe_fast_path(
+                        observer,
+                        start,
+                        &self.fast_path_context(peer, qname_str, qtype, qclass),
+                        &pipeline_id,
+                        FastPathAnswer::StaticRule(rule_name),
+                    );
+                }
                 return Ok(Some(FastPathResponse::Direct(resp)));
             }
         }
@@ -482,6 +587,18 @@ impl Engine {
                         q.tx_id, qname_str, q.qtype, q.qclass, *rcode, answers,
                     )?;
                     self.incr_fastpath_hits();
+                    if let Some((observer, start)) = observed {
+                        self.observe_fast_path(
+                            observer,
+                            start,
+                            &self.fast_path_context(peer, qname_str, qtype, qclass),
+                            &pipeline_id,
+                            FastPathAnswer::CachedRules {
+                                rules: &record.matched_rules,
+                                deciding: record.decided_by_rule.then_some(DecisionKind::Static),
+                            },
+                        );
+                    }
                     return Ok(Some(FastPathResponse::Direct(resp)));
                 }
             }
@@ -551,7 +668,7 @@ impl Engine {
         state_override: Option<Arc<EngineInner>>,
     ) -> anyhow::Result<Bytes> {
         // Track requests and inflight concurrency for diagnostics. / 跟踪请求和进行中的并发以进行诊断
-        let _req_id = self.request_id_counter.fetch_add(1, Ordering::Relaxed);
+        let request_id = self.request_id_counter.fetch_add(1, Ordering::Relaxed);
         self.incr_total_requests();
         struct InflightGuard<'a>(&'a AtomicUsize);
         impl<'a> Drop for InflightGuard<'a> {
@@ -653,12 +770,40 @@ impl Engine {
         let qname_ref = &qname_cow;
         let start = std::time::Instant::now();
 
+        // Observer handle for this request: borrows the parsed query and
+        // reports request_finished when dropped, so cancelled requests
+        // (listener timeouts drop the future) are reported as well.
+        // 本请求的观察者句柄：借用已解析的查询，drop 时上报 request_finished，
+        // 因此被取消的请求（监听器超时会丢弃 future）同样会上报。
+        let mut observed = self.observer.as_deref().map(|observer| {
+            ObservedRequest::new(
+                observer,
+                RequestContext {
+                    request_id,
+                    listener_label: &self.listener_label,
+                    client: peer,
+                    qname: qname_ref,
+                    qtype,
+                    qclass,
+                    background_refresh: skip_cache,
+                },
+                start,
+            )
+        });
+        let observed_ctx = observed.as_ref().map(|observed| &observed.ctx);
+        if let Some(observed) = &observed {
+            observed.observer.request_started(&observed.ctx);
+            observed
+                .observer
+                .pipeline_selected(&observed.ctx, &pipeline_id);
+        }
+
         // Everything below may return the response from several places.
         // The async block funnels every exit through one point so the
         // observer learns the outcome; the block is awaited immediately.
         // 以下代码在多处返回响应；用 async 块包裹使所有出口汇聚到一处，便于观察者
         // 获得请求结果。该块会被立即 await。
-        async {
+        let result: anyhow::Result<Bytes> = async {
             // Find pipeline_opt from pipeline_id / 从 pipeline_id 查找 pipeline_opt
             let pipeline_opt = cfg
                 .pipeline_id_index
@@ -696,8 +841,11 @@ impl Engine {
 
             // Background refresh: Skip cache lookup when skip_cache=true
             // 后台刷新：当 skip_cache=true 时跳过缓存查找
-            if !skip_cache
-                && let Some(resp_bytes) = phases::check_cache(
+            if !skip_cache {
+                if let Some(observed) = &observed {
+                    observed.observer.cache_lookup(&observed.ctx);
+                }
+                if let Some(resp_bytes) = phases::check_cache(
                     self,
                     &phases::CacheLookupContext {
                         state: &state,
@@ -709,10 +857,11 @@ impl Engine {
                         tx_id,
                         start,
                         peer: &peer,
+                        observed: observed_ctx,
                     },
-                )
-            {
-                return Ok(resp_bytes);
+                ) {
+                    return Ok(resp_bytes);
+                }
             }
 
             // RFC 8767 Client Timeout: When serve_stale is enabled with client_timeout > 0,
@@ -769,6 +918,7 @@ impl Engine {
                                     tx_id,
                                     start,
                                     peer: &peer,
+                                    observed: observed_ctx,
                                 },
                             ) {
                                 tracing::debug!(
@@ -796,7 +946,9 @@ impl Engine {
                             tx_id,
                             start,
                             peer: &peer,
+                            observed: observed_ctx,
                         },
+                        CacheHitKind::StaleClientTimeout,
                     ) {
                         tracing::debug!(
                             event = "serve_stale_on_client_timeout",
@@ -841,7 +993,8 @@ impl Engine {
                         edns_present,
                         None,
                         skip_cache,
-                    ),
+                    )
+                    .with_observed(observed_ctx),
                 ),
                 None => {
                     // 使用预分割的默认 upstream 以支持并发查询 / Use pre-split default upstream for concurrent queries
@@ -911,6 +1064,11 @@ impl Engine {
                         let p = &cfg.pipelines[idx];
                         current_pipeline_id = p.id.clone();
                         current_uses_client_ip = p.uses_client_ip;
+                        if let Some(observed) = &observed {
+                            observed
+                                .observer
+                                .pipeline_selected(&observed.ctx, &current_pipeline_id);
+                        }
                         // Must recompute ECS key + dedupe_hash: pipeline changed via Jump,
                         // so the target pipeline's ECS config may differ from the source.
                         // 必须重算 ECS key + dedupe_hash：pipeline 因 Jump 改变，
@@ -938,7 +1096,8 @@ impl Engine {
                                 edns_present,
                                 None,
                                 skip_cache,
-                            ),
+                            )
+                            .with_observed(observed_ctx),
                         );
                     } else {
                         warn!("jump target pipeline not found: {}", pipeline);
@@ -1012,6 +1171,7 @@ impl Engine {
                                 ecs: ecs.as_ref(),
                                 allow_reuse,
                                 reused_response: &mut reused_response,
+                                observed: observed_ctx,
                             },
                         )
                         .await;
@@ -1052,7 +1212,8 @@ impl Engine {
                                         edns_present,
                                         skip_ref,
                                         skip_cache,
-                                    ),
+                                    )
+                                    .with_observed(observed_ctx),
                                 );
                                 continue 'decision_loop;
                             }
@@ -1080,7 +1241,15 @@ impl Engine {
                 }
             }
         }
-        .await
+        .await;
+        if let Some(observed) = observed.as_mut() {
+            observed.set_status(if result.is_ok() {
+                RequestStatus::Completed
+            } else {
+                RequestStatus::Failed
+            });
+        }
+        result
     }
 
     pub(crate) async fn notify_inflight_waiters(&self, dedupe_hash: u64, bytes: &Bytes) {

@@ -270,6 +270,8 @@ fn precompute_action(rule: &RuntimeRule) -> Option<PrecomputedAction> {
     }
 }
 
+/// Test-only shorthand for [`fast_static_match_with_rule`] without the rule name.
+#[cfg(test)]
 pub(crate) fn fast_static_match(
     pipeline: &CompiledPipeline,
     qname: &str,

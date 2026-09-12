@@ -2,6 +2,7 @@ pub mod concurrency;
 pub mod core;
 pub mod execution;
 pub mod matcher_adapter;
+pub(crate) mod observation;
 pub mod phases;
 pub mod pipeline;
 pub mod refresh;

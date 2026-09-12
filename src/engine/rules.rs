@@ -27,6 +27,9 @@ use crate::engine::utils::engine_helpers::{self, build_response};
 use crate::engine::utils::parse_rcode;
 use crate::matcher::RuntimeResponseMatcherWithOp;
 use crate::matcher::eval_match_chain;
+use crate::observe::{RequestContext, RuleMatched, RulePhase};
+
+use super::observation::response_decision_kind;
 
 #[derive(Debug, Clone)]
 pub enum Decision {
@@ -129,6 +132,9 @@ pub struct RuleCacheEntry {
 pub struct RuleCacheRecord {
     pub entry: RuleCacheEntry,
     pub matched_rules: Arc<[Arc<str>]>,
+    /// `false` when no rule decided and the default upstream applied.
+    /// 无规则决定、使用默认上游时为 false。
+    pub decided_by_rule: bool,
 }
 
 impl RuleCacheEntry {
@@ -532,6 +538,8 @@ pub(crate) struct ResponseJumpContext<'a> {
     pub min_ttl: Duration,
     pub upstream_timeout: Duration,
     pub skip_cache: bool,
+    /// Observer context of the request / 所属请求的观察者上下文
+    pub observed: Option<&'a RequestContext<'a>>,
 }
 
 pub(crate) async fn process_response_jump(
@@ -552,6 +560,7 @@ pub(crate) async fn process_response_jump(
         min_ttl,
         upstream_timeout,
         skip_cache,
+        observed,
     } = context;
     let cfg = &state.pipeline;
     struct InflightCleanupGuard {
@@ -613,6 +622,9 @@ pub(crate) async fn process_response_jump(
             }
             return Ok(resp_bytes);
         };
+        if let Some((observer, ctx)) = engine.observer.as_deref().zip(observed) {
+            observer.pipeline_selected(ctx, &pipeline.id);
+        }
 
         let mut ecs_key = pipeline
             .ecs
@@ -634,7 +646,8 @@ pub(crate) async fn process_response_jump(
                     Some(&skip_rules)
                 },
                 skip_cache,
-            ),
+            )
+            .with_observed(observed),
         );
 
         // Resolve nested rule-level jumps first
@@ -658,6 +671,9 @@ pub(crate) async fn process_response_jump(
                     .get(pipeline_id.as_ref())
                     .and_then(|&idx| cfg.pipelines.get(idx))
                 {
+                    if let Some((observer, ctx)) = engine.observer.as_deref().zip(observed) {
+                        observer.pipeline_selected(ctx, &next_pipeline.id);
+                    }
                     ecs_key = next_pipeline
                         .ecs
                         .as_ref()
@@ -674,7 +690,8 @@ pub(crate) async fn process_response_jump(
                             edns_present,
                             None,
                             skip_cache,
-                        ),
+                        )
+                        .with_observed(observed),
                     );
                     continue;
                 } else {
@@ -944,6 +961,22 @@ pub(crate) async fn process_response_jump(
                                 },
                             )
                         }; // guards are dropped here / 锁在此处释放
+
+                        if resp_match_ok
+                            && !response_matchers.is_empty()
+                            && let Some((observer, ctx)) = engine.observer.as_deref().zip(observed)
+                        {
+                            observer.rule_matched(
+                                ctx,
+                                &RuleMatched {
+                                    pipeline: &pipeline_id,
+                                    rule: &rule_name,
+                                    phase: RulePhase::Response,
+                                    decision: response_decision_kind(&response_actions_on_match),
+                                    fast_path: false,
+                                },
+                            );
+                        }
 
                         let actions_to_run = if !response_actions_on_match.is_empty()
                             || !response_actions_on_miss.is_empty()
