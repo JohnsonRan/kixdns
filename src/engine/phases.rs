@@ -9,7 +9,7 @@ use crate::engine::upstream::UpstreamFailure;
 use crate::engine::utils::InflightCleanupGuard;
 use crate::engine::utils::engine_helpers::{build_response, build_servfail_response_fast};
 use crate::matcher::{RuntimeResponseMatcherWithOp, eval_match_chain};
-use crate::observe::{CacheHitKind, RuleMatched, RulePhase};
+use crate::observe::{CacheHit, CacheHitKind, RuleEvaluated, RuleMatched, RulePhase};
 use crate::proto_utils;
 use anyhow::Context;
 use bytes::{Bytes, BytesMut};
@@ -174,7 +174,14 @@ pub fn check_cache(engine: &Engine, context: &CacheLookupContext<'_>) -> Option<
                 );
 
                 if let Some((observer, ctx)) = observed {
-                    observer.cache_hit(ctx, CacheHitKind::Stale);
+                    observer.cache_hit(
+                        ctx,
+                        &CacheHit {
+                            kind: CacheHitKind::Stale,
+                            remaining_ttl: None,
+                            original_ttl: Some(Duration::from_secs(hit.original_ttl as u64)),
+                        },
+                    );
                 }
                 return Some(resp_bytes.freeze());
             } else {
@@ -257,7 +264,16 @@ pub fn check_cache(engine: &Engine, context: &CacheLookupContext<'_>) -> Option<
                 );
 
                 if let Some((observer, ctx)) = observed {
-                    observer.cache_hit(ctx, CacheHitKind::Fresh);
+                    observer.cache_hit(
+                        ctx,
+                        &CacheHit {
+                            kind: CacheHitKind::Fresh,
+                            remaining_ttl: Some(Duration::from_secs(
+                                hit.original_ttl.saturating_sub(elapsed) as u64,
+                            )),
+                            original_ttl: Some(Duration::from_secs(hit.original_ttl as u64)),
+                        },
+                    );
                 }
                 return Some(resp_bytes);
             }
@@ -367,7 +383,14 @@ pub fn check_stale_cache(
             }
 
             if let Some((observer, ctx)) = observed {
-                observer.cache_hit(ctx, kind);
+                observer.cache_hit(
+                    ctx,
+                    &CacheHit {
+                        kind,
+                        remaining_ttl: None,
+                        original_ttl: Some(Duration::from_secs(hit.original_ttl as u64)),
+                    },
+                );
             }
             return Some(resp_bytes.freeze());
         }
@@ -746,21 +769,32 @@ pub async fn handle_forward_decision(
                 }
             };
 
-            if resp_match_ok
-                && !skip_cache
+            if !skip_cache
                 && !response_matchers.is_empty()
                 && let Some((observer, ctx)) = observed
             {
-                observer.rule_matched(
+                observer.rule_evaluated(
                     ctx,
-                    &RuleMatched {
+                    &RuleEvaluated {
                         pipeline: pipeline_id,
                         rule: rule_name,
                         phase: RulePhase::Response,
-                        decision: response_decision_kind(response_actions_on_match),
-                        fast_path: false,
+                        matched: resp_match_ok,
+                        matchers: response_matchers.len(),
                     },
                 );
+                if resp_match_ok {
+                    observer.rule_matched(
+                        ctx,
+                        &RuleMatched {
+                            pipeline: pipeline_id,
+                            rule: rule_name,
+                            phase: RulePhase::Response,
+                            decision: response_decision_kind(response_actions_on_match),
+                            fast_path: false,
+                        },
+                    );
+                }
             }
 
             let empty_actions = Vec::new();

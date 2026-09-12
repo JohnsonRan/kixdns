@@ -43,6 +43,7 @@ use std::net::SocketAddr;
 use std::path::Path;
 use std::time::Duration;
 
+use hickory_proto::op::ResponseCode;
 use hickory_proto::rr::{DNSClass, RecordType};
 
 use crate::config::Transport;
@@ -71,14 +72,41 @@ pub trait EngineObserver: Send + Sync + 'static {
     /// and again for every `jump_to_pipeline` decision.
     fn pipeline_selected(&self, ctx: &RequestContext<'_>, pipeline: &str) {}
 
-    /// A rule's matchers evaluated to true.
+    /// The rule cache was consulted for a pipeline: once per lookup, hit or
+    /// miss (a lookup that is skipped, for example during a `continue`
+    /// re-evaluation or a background refresh, is not reported).
+    fn rule_cache_lookup(&self, ctx: &RequestContext<'_>, event: &RuleCacheLookup<'_>) {}
+
+    /// A rule's matchers were evaluated, whether or not they matched. Request
+    /// phase: every candidate rule the pipeline evaluated, in order. Response
+    /// phase: once per rule that has response matchers. Rule cache hits replay
+    /// only [`rule_matched`], not this event.
+    ///
+    /// [`rule_matched`]: EngineObserver::rule_matched
+    fn rule_evaluated(&self, ctx: &RequestContext<'_>, event: &RuleEvaluated<'_>) {}
+
+    /// A rule's matchers evaluated to true. Request-phase matches are
+    /// reported after the pipeline's decision is known, that is after every
+    /// candidate's [`rule_evaluated`], so the decision kind is accurate.
+    ///
+    /// [`rule_evaluated`]: EngineObserver::rule_evaluated
     fn rule_matched(&self, ctx: &RequestContext<'_>, event: &RuleMatched<'_>) {}
+
+    /// A pipeline produced its decision for the request, after rule
+    /// evaluation or from a rule cache hit.
+    fn decision_made(&self, ctx: &RequestContext<'_>, event: &DecisionMade<'_>) {}
 
     /// The response cache was consulted for the request.
     fn cache_lookup(&self, ctx: &RequestContext<'_>) {}
 
     /// The response cache answered the request.
-    fn cache_hit(&self, ctx: &RequestContext<'_>, kind: CacheHitKind) {}
+    fn cache_hit(&self, ctx: &RequestContext<'_>, event: &CacheHit) {}
+
+    /// The response cache had no usable entry. Paired with [`cache_lookup`]:
+    /// every lookup ends in exactly one `cache_hit` or `cache_miss`.
+    ///
+    /// [`cache_lookup`]: EngineObserver::cache_lookup
+    fn cache_miss(&self, ctx: &RequestContext<'_>) {}
 
     /// A query is about to be sent to an upstream server.
     fn upstream_attempt(&self, ctx: &RequestContext<'_>, event: &UpstreamAttempt<'_>) {}
@@ -159,6 +187,74 @@ pub struct RuleMatched<'a> {
     pub fast_path: bool,
 }
 
+/// The rule cache was consulted for a pipeline.
+#[derive(Debug, Clone, Copy)]
+#[non_exhaustive]
+pub struct RuleCacheLookup<'a> {
+    /// Pipeline whose rules were looked up.
+    pub pipeline: &'a str,
+    /// Whether a valid cached decision was found.
+    pub hit: bool,
+    /// Number of request-phase rules recorded with the cached decision;
+    /// `0` on a miss.
+    pub matched_rules: usize,
+}
+
+/// A rule's matchers were evaluated.
+#[derive(Debug, Clone, Copy)]
+#[non_exhaustive]
+pub struct RuleEvaluated<'a> {
+    /// Pipeline that owns the rule.
+    pub pipeline: &'a str,
+    /// Rule name from the configuration.
+    pub rule: &'a str,
+    /// Which matcher list was evaluated.
+    pub phase: RulePhase,
+    /// Whether the matcher chain evaluated to true.
+    pub matched: bool,
+    /// Number of matchers in the evaluated chain.
+    pub matchers: usize,
+}
+
+/// A pipeline produced its decision for the request.
+#[derive(Debug, Clone, Copy)]
+#[non_exhaustive]
+pub struct DecisionMade<'a> {
+    /// Pipeline that produced the decision.
+    pub pipeline: &'a str,
+    /// Rule that decided, or `None` when no rule matched and the default
+    /// upstream applies.
+    pub rule: Option<&'a str>,
+    /// What was decided.
+    pub detail: DecisionDetail<'a>,
+}
+
+/// Content of a decision.
+#[derive(Debug, Clone, Copy)]
+#[non_exhaustive]
+pub enum DecisionDetail<'a> {
+    /// A response is synthesised locally.
+    Static {
+        /// Response code of the synthesised answer.
+        rcode: ResponseCode,
+        /// Number of answer records.
+        answers: usize,
+    },
+    /// The query is forwarded.
+    Forward {
+        /// Configured upstream string (may list several addresses).
+        upstream: &'a str,
+        /// Configured transport; `None` when each address carries its own
+        /// protocol prefix.
+        transport: Option<Transport>,
+    },
+    /// Processing continues in another pipeline.
+    Jump {
+        /// Target pipeline.
+        pipeline: &'a str,
+    },
+}
+
 /// Matching phase of a rule.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
@@ -183,6 +279,18 @@ pub enum DecisionKind {
     /// The rule matched but did not decide; evaluation continues with the
     /// next rule (for example log-only rules or `continue`).
     Continue,
+}
+
+/// The response cache answered a request.
+#[derive(Debug, Clone, Copy)]
+#[non_exhaustive]
+pub struct CacheHit {
+    /// Which kind of entry answered.
+    pub kind: CacheHitKind,
+    /// Time left before the entry's TTL expires; `None` for stale hits.
+    pub remaining_ttl: Option<Duration>,
+    /// TTL the entry was cached with, when known.
+    pub original_ttl: Option<Duration>,
 }
 
 /// Which kind of cached response answered a request.
@@ -225,6 +333,12 @@ pub struct UpstreamResult<'a> {
     pub outcome: UpstreamOutcome,
     /// Time spent on this attempt.
     pub latency: Duration,
+    /// Response code of the received answer; `None` when no answer was
+    /// received or it could not be parsed.
+    pub rcode: Option<ResponseCode>,
+    /// TC bit of the received answer; `None` when no answer was received or
+    /// it could not be parsed.
+    pub truncated: Option<bool>,
     /// Error for [`UpstreamOutcome::Error`]; `None` otherwise.
     pub error: Option<&'a anyhow::Error>,
 }
@@ -319,6 +433,32 @@ impl EngineObserver for TracingObserver {
         );
     }
 
+    fn rule_cache_lookup(&self, ctx: &RequestContext<'_>, event: &RuleCacheLookup<'_>) {
+        tracing::debug!(
+            target: TRACE_TARGET,
+            event = "rule_cache_lookup",
+            request_id = ctx.request_id,
+            pipeline = event.pipeline,
+            hit = event.hit,
+            matched_rules = event.matched_rules,
+            "rule cache lookup"
+        );
+    }
+
+    fn rule_evaluated(&self, ctx: &RequestContext<'_>, event: &RuleEvaluated<'_>) {
+        tracing::debug!(
+            target: TRACE_TARGET,
+            event = "rule_evaluated",
+            request_id = ctx.request_id,
+            pipeline = event.pipeline,
+            rule = event.rule,
+            phase = ?event.phase,
+            matched = event.matched,
+            matchers = event.matchers,
+            "rule evaluated"
+        );
+    }
+
     fn rule_matched(&self, ctx: &RequestContext<'_>, event: &RuleMatched<'_>) {
         tracing::debug!(
             target: TRACE_TARGET,
@@ -333,6 +473,18 @@ impl EngineObserver for TracingObserver {
         );
     }
 
+    fn decision_made(&self, ctx: &RequestContext<'_>, event: &DecisionMade<'_>) {
+        tracing::debug!(
+            target: TRACE_TARGET,
+            event = "decision_made",
+            request_id = ctx.request_id,
+            pipeline = event.pipeline,
+            rule = event.rule,
+            detail = ?event.detail,
+            "decision made"
+        );
+    }
+
     fn cache_lookup(&self, ctx: &RequestContext<'_>) {
         tracing::debug!(
             target: TRACE_TARGET,
@@ -342,13 +494,24 @@ impl EngineObserver for TracingObserver {
         );
     }
 
-    fn cache_hit(&self, ctx: &RequestContext<'_>, kind: CacheHitKind) {
+    fn cache_hit(&self, ctx: &RequestContext<'_>, event: &CacheHit) {
         tracing::debug!(
             target: TRACE_TARGET,
             event = "cache_hit",
             request_id = ctx.request_id,
-            kind = ?kind,
+            kind = ?event.kind,
+            remaining_ttl_s = event.remaining_ttl.map(|ttl| ttl.as_secs()),
+            original_ttl_s = event.original_ttl.map(|ttl| ttl.as_secs()),
             "cache hit"
+        );
+    }
+
+    fn cache_miss(&self, ctx: &RequestContext<'_>) {
+        tracing::debug!(
+            target: TRACE_TARGET,
+            event = "cache_miss",
+            request_id = ctx.request_id,
+            "cache miss"
         );
     }
 
@@ -372,6 +535,8 @@ impl EngineObserver for TracingObserver {
             transport = ?event.transport,
             outcome = ?event.outcome,
             latency_us = event.latency.as_micros() as u64,
+            rcode = event.rcode.map(tracing::field::display),
+            truncated = event.truncated,
             error = event.error.map(tracing::field::display),
             "upstream result"
         );
@@ -430,7 +595,44 @@ mod tests {
                 },
             );
             observer.cache_lookup(&ctx);
-            observer.cache_hit(&ctx, CacheHitKind::Fresh);
+            observer.cache_hit(
+                &ctx,
+                &CacheHit {
+                    kind: CacheHitKind::Fresh,
+                    remaining_ttl: Some(Duration::from_secs(30)),
+                    original_ttl: Some(Duration::from_secs(60)),
+                },
+            );
+            observer.cache_miss(&ctx);
+            observer.rule_cache_lookup(
+                &ctx,
+                &RuleCacheLookup {
+                    pipeline: "main",
+                    hit: false,
+                    matched_rules: 0,
+                },
+            );
+            observer.rule_evaluated(
+                &ctx,
+                &RuleEvaluated {
+                    pipeline: "main",
+                    rule: "static",
+                    phase: RulePhase::Request,
+                    matched: true,
+                    matchers: 1,
+                },
+            );
+            observer.decision_made(
+                &ctx,
+                &DecisionMade {
+                    pipeline: "main",
+                    rule: Some("static"),
+                    detail: DecisionDetail::Static {
+                        rcode: ResponseCode::NXDomain,
+                        answers: 0,
+                    },
+                },
+            );
             observer.upstream_attempt(
                 &ctx,
                 &UpstreamAttempt {
@@ -445,6 +647,8 @@ mod tests {
                     transport: Transport::Udp,
                     outcome: UpstreamOutcome::Error,
                     latency: Duration::from_millis(3),
+                    rcode: None,
+                    truncated: None,
                     error: Some(&error),
                 },
             );

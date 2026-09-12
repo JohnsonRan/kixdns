@@ -20,13 +20,14 @@ use crate::matcher::{
 
 use super::core::Engine;
 use super::matcher_adapter::{MatcherContext, matcher_matches};
-use super::observation::{Observed, decision_kind, report_matched_rules};
+use super::observation::{Observed, decision_kind, report_decision, report_matched_rules};
 use super::rules::Decision;
 use super::rules::{
     RuleCacheEntry, RuleCacheRecord, calculate_rule_hash, contains_continue, fast_hash_str,
 };
 use super::types::EngineInner;
 use super::{make_static_cname_answer, make_static_ip_answer};
+use crate::observe::{RuleCacheLookup, RuleEvaluated, RulePhase};
 
 /// Request and manager references required to select a runtime pipeline.
 pub struct PipelineSelectionContext<'a> {
@@ -279,19 +280,46 @@ impl Engine {
                 self.rule_cache.remove(&rule_hash);
             } else if entry.matches(&pipeline.id, qname, qtype, qclass, client_ip, include_ip) {
                 if let Some((observer, ctx)) = request.observed {
+                    observer.rule_cache_lookup(
+                        ctx,
+                        &RuleCacheLookup {
+                            pipeline: &pipeline.id,
+                            hit: true,
+                            matched_rules: record.matched_rules.len(),
+                        },
+                    );
+                    let deciding_rule = record
+                        .decided_by_rule
+                        .then(|| record.matched_rules.last())
+                        .flatten();
                     report_matched_rules(
                         observer,
                         ctx,
                         &pipeline.id,
                         &record.matched_rules,
-                        record
-                            .decided_by_rule
-                            .then(|| decision_kind(&entry.decision)),
+                        deciding_rule.map(|_| decision_kind(&entry.decision)),
                         false,
+                    );
+                    report_decision(
+                        observer,
+                        ctx,
+                        &pipeline.id,
+                        deciding_rule.map(AsRef::as_ref),
+                        &entry.decision,
                     );
                 }
                 return (*entry.decision).clone();
             }
+        }
+        if allow_rule_cache_lookup && let Some((observer, ctx)) = request.observed {
+            observer.rule_cache_lookup(
+                ctx,
+                &RuleCacheLookup {
+                    pipeline: &pipeline.id,
+                    hit: false,
+                    matched_rules: 0,
+                },
+            );
         }
 
         // 2. Evaluate rules in order; None means no rule decided and the
@@ -323,6 +351,16 @@ impl Engine {
                 &matched_rules,
                 decided_by_rule.then(|| decision_kind(&decision)),
                 false,
+            );
+            report_decision(
+                observer,
+                ctx,
+                &pipeline.id,
+                decided_by_rule
+                    .then(|| matched_rules.last())
+                    .flatten()
+                    .map(AsRef::as_ref),
+                &decision,
             );
         }
         self.insert_rule_cache(
@@ -434,6 +472,18 @@ impl Engine {
                     matcher_matches(&m.matcher, &ctx)
                 },
             );
+            if let Some((observer, observed_ctx)) = request.observed {
+                observer.rule_evaluated(
+                    observed_ctx,
+                    &RuleEvaluated {
+                        pipeline: &pipeline.id,
+                        rule: &rule.name,
+                        phase: RulePhase::Request,
+                        matched: req_match,
+                        matchers: rule.matchers.len(),
+                    },
+                );
+            }
 
             if req_match {
                 matched_rules.push(rule.name.clone());

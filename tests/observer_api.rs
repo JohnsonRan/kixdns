@@ -2,8 +2,9 @@
 //!
 //! A recording `EngineObserver` is installed through `Engine::builder` and the
 //! tests assert the events the engine reports for static rules (slow and
-//! fast path), response cache hits (fresh and stale), rule cache replays,
-//! upstream attempts, cancelled requests and configuration reloads.
+//! fast path), response cache hits and misses (fresh and stale), rule cache
+//! lookups and replays, rule evaluation and decisions, upstream attempts,
+//! cancelled requests and configuration reloads.
 
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -20,9 +21,9 @@ use kixdns::config::{Transport, parse_config};
 use kixdns::engine::{Engine, FastPathResponse};
 use kixdns::matcher::RuntimePipelineConfig;
 use kixdns::observe::{
-    CacheHitKind, ConfigLoaded, ConfigReloadFailed, DecisionKind, EngineObserver, RequestContext,
-    RequestOutcome, RequestStatus, RuleMatched, RulePhase, UpstreamAttempt, UpstreamOutcome,
-    UpstreamResult,
+    CacheHit, CacheHitKind, ConfigLoaded, ConfigReloadFailed, DecisionDetail, DecisionKind,
+    DecisionMade, EngineObserver, RequestContext, RequestOutcome, RequestStatus, RuleCacheLookup,
+    RuleEvaluated, RuleMatched, RulePhase, UpstreamAttempt, UpstreamOutcome, UpstreamResult,
 };
 
 #[ctor::ctor]
@@ -33,6 +34,41 @@ fn init() {
 // ============================================================================
 // Recording observer / 记录型观察者
 // ============================================================================
+
+/// Owned copy of a `DecisionDetail`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Detail {
+    Static {
+        rcode: ResponseCode,
+        answers: usize,
+    },
+    Forward {
+        upstream: String,
+        transport: Option<Transport>,
+    },
+    Jump {
+        pipeline: String,
+    },
+}
+
+impl From<DecisionDetail<'_>> for Detail {
+    fn from(detail: DecisionDetail<'_>) -> Self {
+        match detail {
+            DecisionDetail::Static { rcode, answers } => Detail::Static { rcode, answers },
+            DecisionDetail::Forward {
+                upstream,
+                transport,
+            } => Detail::Forward {
+                upstream: upstream.to_string(),
+                transport,
+            },
+            DecisionDetail::Jump { pipeline } => Detail::Jump {
+                pipeline: pipeline.to_string(),
+            },
+            _ => unreachable!("unknown decision detail"),
+        }
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Event {
@@ -51,6 +87,20 @@ enum Event {
         id: u64,
         pipeline: String,
     },
+    RuleCacheLookup {
+        id: u64,
+        pipeline: String,
+        hit: bool,
+        matched_rules: usize,
+    },
+    RuleEvaluated {
+        id: u64,
+        pipeline: String,
+        rule: String,
+        phase: RulePhase,
+        matched: bool,
+        matchers: usize,
+    },
     Rule {
         id: u64,
         pipeline: String,
@@ -59,12 +109,23 @@ enum Event {
         decision: DecisionKind,
         fast_path: bool,
     },
+    Decision {
+        id: u64,
+        pipeline: String,
+        rule: Option<String>,
+        detail: Detail,
+    },
     CacheLookup {
         id: u64,
     },
     CacheHit {
         id: u64,
         kind: CacheHitKind,
+        has_remaining_ttl: bool,
+        original_ttl: Option<Duration>,
+    },
+    CacheMiss {
+        id: u64,
     },
     UpstreamAttempt {
         id: u64,
@@ -75,6 +136,8 @@ enum Event {
         id: u64,
         upstream: String,
         outcome: UpstreamOutcome,
+        rcode: Option<ResponseCode>,
+        truncated: Option<bool>,
         has_error: bool,
     },
     ConfigLoaded {
@@ -147,6 +210,26 @@ impl EngineObserver for Recorder {
         });
     }
 
+    fn rule_cache_lookup(&self, ctx: &RequestContext<'_>, event: &RuleCacheLookup<'_>) {
+        self.push(Event::RuleCacheLookup {
+            id: ctx.request_id,
+            pipeline: event.pipeline.to_string(),
+            hit: event.hit,
+            matched_rules: event.matched_rules,
+        });
+    }
+
+    fn rule_evaluated(&self, ctx: &RequestContext<'_>, event: &RuleEvaluated<'_>) {
+        self.push(Event::RuleEvaluated {
+            id: ctx.request_id,
+            pipeline: event.pipeline.to_string(),
+            rule: event.rule.to_string(),
+            phase: event.phase,
+            matched: event.matched,
+            matchers: event.matchers,
+        });
+    }
+
     fn rule_matched(&self, ctx: &RequestContext<'_>, event: &RuleMatched<'_>) {
         self.push(Event::Rule {
             id: ctx.request_id,
@@ -158,15 +241,30 @@ impl EngineObserver for Recorder {
         });
     }
 
+    fn decision_made(&self, ctx: &RequestContext<'_>, event: &DecisionMade<'_>) {
+        self.push(Event::Decision {
+            id: ctx.request_id,
+            pipeline: event.pipeline.to_string(),
+            rule: event.rule.map(str::to_string),
+            detail: event.detail.into(),
+        });
+    }
+
     fn cache_lookup(&self, ctx: &RequestContext<'_>) {
         self.push(Event::CacheLookup { id: ctx.request_id });
     }
 
-    fn cache_hit(&self, ctx: &RequestContext<'_>, kind: CacheHitKind) {
+    fn cache_hit(&self, ctx: &RequestContext<'_>, event: &CacheHit) {
         self.push(Event::CacheHit {
             id: ctx.request_id,
-            kind,
+            kind: event.kind,
+            has_remaining_ttl: event.remaining_ttl.is_some(),
+            original_ttl: event.original_ttl,
         });
+    }
+
+    fn cache_miss(&self, ctx: &RequestContext<'_>) {
+        self.push(Event::CacheMiss { id: ctx.request_id });
     }
 
     fn upstream_attempt(&self, ctx: &RequestContext<'_>, event: &UpstreamAttempt<'_>) {
@@ -182,6 +280,8 @@ impl EngineObserver for Recorder {
             id: ctx.request_id,
             upstream: event.upstream.to_string(),
             outcome: event.outcome,
+            rcode: event.rcode,
+            truncated: event.truncated,
             has_error: event.error.is_some(),
         });
     }
@@ -286,15 +386,36 @@ fn events_of(events: &[Event], request_id: u64) -> Vec<Event> {
             Event::Started { id, .. }
             | Event::Finished { id, .. }
             | Event::Pipeline { id, .. }
+            | Event::RuleCacheLookup { id, .. }
+            | Event::RuleEvaluated { id, .. }
             | Event::Rule { id, .. }
+            | Event::Decision { id, .. }
             | Event::CacheLookup { id }
             | Event::CacheHit { id, .. }
+            | Event::CacheMiss { id }
             | Event::UpstreamAttempt { id, .. }
             | Event::UpstreamResult { id, .. } => *id == request_id,
             Event::ConfigLoaded { .. } | Event::ConfigReloadFailed { .. } => false,
         })
         .cloned()
         .collect()
+}
+
+fn started(id: u64, qname: &str) -> Event {
+    Event::Started {
+        id,
+        qname: qname.into(),
+        listener: "edge".into(),
+        client: peer(),
+        background: false,
+    }
+}
+
+fn finished(id: u64) -> Event {
+    Event::Finished {
+        id,
+        status: RequestStatus::Completed,
+    }
 }
 
 fn static_config(ip: &str) -> String {
@@ -367,18 +488,27 @@ async fn static_rule_is_reported_on_slow_and_fast_paths() {
     assert_eq!(
         events_of(&events, id),
         vec![
-            Event::Started {
-                id,
-                qname: "a.blocked.test".into(),
-                listener: "edge".into(),
-                client: peer(),
-                background: false,
-            },
+            started(id, "a.blocked.test"),
             Event::Pipeline {
                 id,
                 pipeline: "main".into()
             },
             Event::CacheLookup { id },
+            Event::CacheMiss { id },
+            Event::RuleCacheLookup {
+                id,
+                pipeline: "main".into(),
+                hit: false,
+                matched_rules: 0,
+            },
+            Event::RuleEvaluated {
+                id,
+                pipeline: "main".into(),
+                rule: "block".into(),
+                phase: RulePhase::Request,
+                matched: true,
+                matchers: 1,
+            },
             Event::Rule {
                 id,
                 pipeline: "main".into(),
@@ -387,10 +517,16 @@ async fn static_rule_is_reported_on_slow_and_fast_paths() {
                 decision: DecisionKind::Static,
                 fast_path: false,
             },
-            Event::Finished {
+            Event::Decision {
                 id,
-                status: RequestStatus::Completed
+                pipeline: "main".into(),
+                rule: Some("block".into()),
+                detail: Detail::Static {
+                    rcode: ResponseCode::NXDomain,
+                    answers: 0,
+                },
             },
+            finished(id),
         ]
     );
 
@@ -405,18 +541,13 @@ async fn static_rule_is_reported_on_slow_and_fast_paths() {
     assert_eq!(
         events_of(&events, id),
         vec![
-            Event::Started {
-                id,
-                qname: "b.blocked.test".into(),
-                listener: "edge".into(),
-                client: peer(),
-                background: false,
-            },
+            started(id, "b.blocked.test"),
             Event::Pipeline {
                 id,
                 pipeline: "main".into()
             },
             Event::CacheLookup { id },
+            Event::CacheMiss { id },
             Event::Rule {
                 id,
                 pipeline: "main".into(),
@@ -425,10 +556,16 @@ async fn static_rule_is_reported_on_slow_and_fast_paths() {
                 decision: DecisionKind::Static,
                 fast_path: true,
             },
-            Event::Finished {
+            Event::Decision {
                 id,
-                status: RequestStatus::Completed
+                pipeline: "main".into(),
+                rule: Some("block".into()),
+                detail: Detail::Static {
+                    rcode: ResponseCode::NXDomain,
+                    answers: 0,
+                },
             },
+            finished(id),
         ]
     );
 
@@ -440,14 +577,24 @@ async fn static_rule_is_reported_on_slow_and_fast_paths() {
     assert!(matches!(fast, Some(FastPathResponse::CacheHit { .. })));
     let events = recorder.drain();
     let id = request_id_for(&events, "a.blocked.test");
-    assert!(events_of(&events, id).contains(&Event::CacheHit {
-        id,
-        kind: CacheHitKind::Fresh
-    }));
-    assert!(events_of(&events, id).contains(&Event::Finished {
-        id,
-        status: RequestStatus::Completed
-    }));
+    assert_eq!(
+        events_of(&events, id),
+        vec![
+            started(id, "a.blocked.test"),
+            Event::Pipeline {
+                id,
+                pipeline: "main".into()
+            },
+            Event::CacheLookup { id },
+            Event::CacheHit {
+                id,
+                kind: CacheHitKind::Fresh,
+                has_remaining_ttl: true,
+                original_ttl: Some(Duration::from_secs(60)),
+            },
+            finished(id),
+        ]
+    );
 }
 
 #[tokio::test]
@@ -487,8 +634,18 @@ async fn rule_cache_hits_replay_matched_rules() {
             })
             .collect()
     };
+    let decision = |id: u64| Event::Decision {
+        id,
+        pipeline: "main".into(),
+        rule: Some("block".into()),
+        detail: Detail::Static {
+            rcode: ResponseCode::NXDomain,
+            answers: 0,
+        },
+    };
 
-    // First evaluation records both matching rules / 首次求值记录两条命中规则
+    // First evaluation: both candidate rules are evaluated and match
+    // 首次求值：两条候选规则都被求值并命中
     engine
         .handle_packet(&query("x.example"), peer())
         .await
@@ -496,22 +653,129 @@ async fn rule_cache_hits_replay_matched_rules() {
     let events = recorder.drain();
     let id = request_id_for(&events, "x.example");
     assert_eq!(
-        rule_events(&events, id),
+        events_of(&events, id),
         vec![
-            ("audit".to_string(), DecisionKind::Continue, false),
-            ("block".to_string(), DecisionKind::Static, false),
+            started(id, "x.example"),
+            Event::Pipeline {
+                id,
+                pipeline: "main".into()
+            },
+            Event::CacheLookup { id },
+            Event::CacheMiss { id },
+            Event::RuleCacheLookup {
+                id,
+                pipeline: "main".into(),
+                hit: false,
+                matched_rules: 0,
+            },
+            Event::RuleEvaluated {
+                id,
+                pipeline: "main".into(),
+                rule: "audit".into(),
+                phase: RulePhase::Request,
+                matched: true,
+                matchers: 1,
+            },
+            Event::RuleEvaluated {
+                id,
+                pipeline: "main".into(),
+                rule: "block".into(),
+                phase: RulePhase::Request,
+                matched: true,
+                matchers: 1,
+            },
+            // rule_matched is reported once the pipeline's decision is known,
+            // after every candidate was evaluated / 规则命中在管线决策确定后统一上报
+            Event::Rule {
+                id,
+                pipeline: "main".into(),
+                rule: "audit".into(),
+                phase: RulePhase::Request,
+                decision: DecisionKind::Continue,
+                fast_path: false,
+            },
+            Event::Rule {
+                id,
+                pipeline: "main".into(),
+                rule: "block".into(),
+                phase: RulePhase::Request,
+                decision: DecisionKind::Static,
+                fast_path: false,
+            },
+            decision(id),
+            finished(id),
         ]
     );
 
     // min_ttl = 0 keeps the static answer out of the response cache, so the
-    // fast path reaches the rule cache and replays the recorded rules.
-    // min_ttl = 0 使静态应答不进入响应缓存，快速路径到达规则缓存并回放规则。
+    // next slow-path request reaches the rule cache: the recorded rules are
+    // replayed and the decision is reported without re-evaluating anything.
+    // min_ttl = 0 使静态应答不进入响应缓存，下一次慢路径请求到达规则缓存：
+    // 回放记录的规则并上报决策，不再重新求值。
+    engine
+        .handle_packet(&query("x.example"), peer())
+        .await
+        .unwrap();
+    let events = recorder.drain();
+    let id = request_id_for(&events, "x.example");
+    assert_eq!(
+        events_of(&events, id),
+        vec![
+            started(id, "x.example"),
+            Event::Pipeline {
+                id,
+                pipeline: "main".into()
+            },
+            Event::CacheLookup { id },
+            Event::CacheMiss { id },
+            Event::RuleCacheLookup {
+                id,
+                pipeline: "main".into(),
+                hit: true,
+                matched_rules: 2,
+            },
+            Event::Rule {
+                id,
+                pipeline: "main".into(),
+                rule: "audit".into(),
+                phase: RulePhase::Request,
+                decision: DecisionKind::Continue,
+                fast_path: false,
+            },
+            Event::Rule {
+                id,
+                pipeline: "main".into(),
+                rule: "block".into(),
+                phase: RulePhase::Request,
+                decision: DecisionKind::Static,
+                fast_path: false,
+            },
+            decision(id),
+            finished(id),
+        ]
+    );
+
+    // The fast path reaches the same rule cache entry and replays it too
+    // 快速路径到达同一规则缓存条目并同样回放
     let fast = engine
         .handle_packet_fast(&query("x.example"), peer())
         .unwrap();
     assert!(matches!(fast, Some(FastPathResponse::Direct(_))));
     let events = recorder.drain();
     let id = request_id_for(&events, "x.example");
+    let mine = events_of(&events, id);
+    assert!(mine.contains(&Event::RuleCacheLookup {
+        id,
+        pipeline: "main".into(),
+        hit: true,
+        matched_rules: 2,
+    }));
+    assert!(
+        !mine
+            .iter()
+            .any(|event| matches!(event, Event::RuleEvaluated { .. })),
+        "rule cache replays must not report rule_evaluated: {mine:#?}"
+    );
     assert_eq!(
         rule_events(&events, id),
         vec![
@@ -519,6 +783,7 @@ async fn rule_cache_hits_replay_matched_rules() {
             ("block".to_string(), DecisionKind::Static, true),
         ]
     );
+    assert!(mine.contains(&decision(id)));
 }
 
 #[tokio::test]
@@ -543,7 +808,8 @@ async fn upstream_success_then_fresh_and_stale_cache_hits() {
     .to_string();
     let (engine, recorder) = observed_engine(&raw);
 
-    // Miss: forwarded to the echo upstream / 未命中：转发到回显上游
+    // Miss: evaluated by the rules and forwarded to the echo upstream
+    // 未命中：经规则求值后转发到回显上游
     let response = engine
         .handle_packet(&query("cache.example"), peer())
         .await
@@ -554,18 +820,27 @@ async fn upstream_success_then_fresh_and_stale_cache_hits() {
     assert_eq!(
         events_of(&events, id),
         vec![
-            Event::Started {
-                id,
-                qname: "cache.example".into(),
-                listener: "edge".into(),
-                client: peer(),
-                background: false,
-            },
+            started(id, "cache.example"),
             Event::Pipeline {
                 id,
                 pipeline: "main".into()
             },
             Event::CacheLookup { id },
+            Event::CacheMiss { id },
+            Event::RuleCacheLookup {
+                id,
+                pipeline: "main".into(),
+                hit: false,
+                matched_rules: 0,
+            },
+            Event::RuleEvaluated {
+                id,
+                pipeline: "main".into(),
+                rule: "fwd".into(),
+                phase: RulePhase::Request,
+                matched: true,
+                matchers: 1,
+            },
             Event::Rule {
                 id,
                 pipeline: "main".into(),
@@ -573,6 +848,15 @@ async fn upstream_success_then_fresh_and_stale_cache_hits() {
                 phase: RulePhase::Request,
                 decision: DecisionKind::Forward,
                 fast_path: false,
+            },
+            Event::Decision {
+                id,
+                pipeline: "main".into(),
+                rule: Some("fwd".into()),
+                detail: Detail::Forward {
+                    upstream: upstream.clone(),
+                    transport: Some(Transport::Udp),
+                },
             },
             Event::UpstreamAttempt {
                 id,
@@ -583,12 +867,11 @@ async fn upstream_success_then_fresh_and_stale_cache_hits() {
                 id,
                 upstream: upstream.clone(),
                 outcome: UpstreamOutcome::Success,
+                rcode: Some(ResponseCode::NoError),
+                truncated: Some(false),
                 has_error: false,
             },
-            Event::Finished {
-                id,
-                status: RequestStatus::Completed
-            },
+            finished(id),
         ]
     );
 
@@ -602,13 +885,7 @@ async fn upstream_success_then_fresh_and_stale_cache_hits() {
     assert_eq!(
         events_of(&events, id),
         vec![
-            Event::Started {
-                id,
-                qname: "cache.example".into(),
-                listener: "edge".into(),
-                client: peer(),
-                background: false,
-            },
+            started(id, "cache.example"),
             Event::Pipeline {
                 id,
                 pipeline: "main".into()
@@ -616,12 +893,11 @@ async fn upstream_success_then_fresh_and_stale_cache_hits() {
             Event::CacheLookup { id },
             Event::CacheHit {
                 id,
-                kind: CacheHitKind::Fresh
+                kind: CacheHitKind::Fresh,
+                has_remaining_ttl: true,
+                original_ttl: Some(Duration::from_secs(1)),
             },
-            Event::Finished {
-                id,
-                status: RequestStatus::Completed
-            },
+            finished(id),
         ]
     );
 
@@ -637,14 +913,19 @@ async fn upstream_success_then_fresh_and_stale_cache_hits() {
     assert!(
         mine.contains(&Event::CacheHit {
             id,
-            kind: CacheHitKind::Stale
+            kind: CacheHitKind::Stale,
+            has_remaining_ttl: false,
+            original_ttl: Some(Duration::from_secs(1)),
         }),
         "{mine:#?}"
     );
-    assert!(mine.contains(&Event::Finished {
-        id,
-        status: RequestStatus::Completed
-    }));
+    assert!(
+        !mine
+            .iter()
+            .any(|event| matches!(event, Event::CacheMiss { .. })),
+        "a stale hit is not a miss: {mine:#?}"
+    );
+    assert!(mine.contains(&finished(id)));
 }
 
 #[tokio::test]
@@ -685,17 +966,13 @@ async fn failed_upstream_is_reported_with_error() {
             id,
             upstream: "127.0.0.1:9".into(),
             outcome: UpstreamOutcome::Error,
+            rcode: None,
+            truncated: None,
             has_error: true,
         }),
         "{mine:#?}"
     );
-    assert_eq!(
-        mine.last(),
-        Some(&Event::Finished {
-            id,
-            status: RequestStatus::Completed
-        })
-    );
+    assert_eq!(mine.last(), Some(&finished(id)));
 }
 
 #[tokio::test]

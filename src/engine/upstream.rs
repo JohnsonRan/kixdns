@@ -318,6 +318,8 @@ pub async fn forward_upstream(
 
         match res {
             Ok(ref bytes) => {
+                // Quick check rcode / 快速解析响应码
+                let quick = crate::proto_utils::parse_response_quick(bytes);
                 if let Some((observer, ctx)) = observed {
                     observer.upstream_result(
                         ctx,
@@ -326,6 +328,8 @@ pub async fn forward_upstream(
                             transport: transport_for_addr,
                             outcome: UpstreamOutcome::Success,
                             latency: dur,
+                            rcode: quick.as_ref().map(|qr| qr.rcode),
+                            truncated: quick.as_ref().map(|qr| qr.truncated),
                             error: None,
                         },
                     );
@@ -342,8 +346,7 @@ pub async fn forward_upstream(
                     .metrics_last_upstream_latency_ns
                     .store(dur.as_nanos() as u64, Ordering::Relaxed);
 
-                // Quick check rcode logging
-                if let Some(qr) = crate::proto_utils::parse_response_quick(bytes) {
+                if let Some(qr) = quick {
                     tracing::debug!(upstream=%up, upstream_ns = dur.as_nanos() as u64, rcode = %qr.rcode, "upstream call succeeded");
                 }
                 return Ok((bytes.clone(), upstream_with_proto));
@@ -357,6 +360,8 @@ pub async fn forward_upstream(
                             transport: transport_for_addr,
                             outcome: UpstreamOutcome::Error,
                             latency: dur,
+                            rcode: None,
+                            truncated: None,
                             error: Some(&err),
                         },
                     );
@@ -465,7 +470,10 @@ pub async fn forward_upstream(
         match result {
             Ok((up_proto, addr, transport_for_task, res, dur)) => {
                 // Report the outcome of this attempt / 上报本次尝试的结果
-                let report = |outcome: UpstreamOutcome, error: Option<&anyhow::Error>| {
+                let report = |outcome: UpstreamOutcome,
+                              rcode: Option<ResponseCode>,
+                              truncated: Option<bool>,
+                              error: Option<&anyhow::Error>| {
                     if let Some((observer, ctx)) = observed {
                         observer.upstream_result(
                             ctx,
@@ -474,6 +482,8 @@ pub async fn forward_upstream(
                                 transport: transport_for_task,
                                 outcome,
                                 latency: dur,
+                                rcode,
+                                truncated,
                                 error,
                             },
                         );
@@ -482,19 +492,21 @@ pub async fn forward_upstream(
                 match res {
                     Ok(bytes) => {
                         // 快速解析响应码 / Quick parse response code
-                        let should_accept =
-                            if let Some(qr) = crate::proto_utils::parse_response_quick(&bytes) {
-                                match qr.rcode {
-                                    ResponseCode::NoError => true,
-                                    ResponseCode::ServFail | ResponseCode::Refused => false,
-                                    _ => true,
-                                }
-                            } else {
-                                true
-                            };
+                        let quick = crate::proto_utils::parse_response_quick(&bytes);
+                        let rcode = quick.as_ref().map(|qr| qr.rcode);
+                        let truncated = quick.as_ref().map(|qr| qr.truncated);
+                        let should_accept = if let Some(qr) = quick {
+                            match qr.rcode {
+                                ResponseCode::NoError => true,
+                                ResponseCode::ServFail | ResponseCode::Refused => false,
+                                _ => true,
+                            }
+                        } else {
+                            true
+                        };
 
                         if should_accept {
-                            report(UpstreamOutcome::Success, None);
+                            report(UpstreamOutcome::Success, rcode, truncated, None);
                             engine
                                 .metrics_upstream_calls
                                 .fetch_add(1, Ordering::Relaxed);
@@ -512,10 +524,10 @@ pub async fn forward_upstream(
 
                             return Ok((bytes, up_proto));
                         }
-                        report(UpstreamOutcome::Rejected, None);
+                        report(UpstreamOutcome::Rejected, rcode, truncated, None);
                     }
                     Err(err) => {
-                        report(UpstreamOutcome::Error, Some(&err));
+                        report(UpstreamOutcome::Error, None, None, Some(&err));
                         tracing::warn!(upstream=%up_proto, error=%err, elapsed_ns = dur.as_nanos() as u64, "upstream call failed, waiting for others");
                         last_err = Some(err);
                     }

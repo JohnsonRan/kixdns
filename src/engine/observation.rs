@@ -9,8 +9,8 @@ use std::time::Instant;
 use crate::config::Action;
 use crate::engine::rules::Decision;
 use crate::observe::{
-    DecisionKind, EngineObserver, RequestContext, RequestOutcome, RequestStatus, RuleMatched,
-    RulePhase,
+    DecisionDetail, DecisionKind, DecisionMade, EngineObserver, RequestContext, RequestOutcome,
+    RequestStatus, RuleMatched, RulePhase,
 };
 
 /// Observer and request context of the request being processed. The engine
@@ -65,6 +65,45 @@ pub(crate) fn decision_kind(decision: &Decision) -> DecisionKind {
         Decision::Forward { .. } => DecisionKind::Forward,
         Decision::Jump { .. } => DecisionKind::Jump,
     }
+}
+
+/// Content of a request-phase decision, borrowed from it.
+pub(crate) fn decision_detail(decision: &Decision) -> DecisionDetail<'_> {
+    match decision {
+        Decision::Static { rcode, answers } => DecisionDetail::Static {
+            rcode: *rcode,
+            answers: answers.len(),
+        },
+        Decision::Forward {
+            upstream,
+            transport,
+            ..
+        } => DecisionDetail::Forward {
+            upstream,
+            transport: *transport,
+        },
+        Decision::Jump { pipeline } => DecisionDetail::Jump { pipeline },
+    }
+}
+
+/// Report the decision a pipeline reached. `rule` is the deciding rule, or
+/// `None` when the default upstream applied. / 上报管线得出的决策；`rule` 为决定性规则，
+/// 走默认上游时为 None。
+pub(crate) fn report_decision(
+    observer: &dyn EngineObserver,
+    ctx: &RequestContext<'_>,
+    pipeline: &str,
+    rule: Option<&str>,
+    decision: &Decision,
+) {
+    observer.decision_made(
+        ctx,
+        &DecisionMade {
+            pipeline,
+            rule,
+            detail: decision_detail(decision),
+        },
+    );
 }
 
 /// Kind of decision a response-phase action list leads to. An empty list (or

@@ -27,7 +27,7 @@ use crate::engine::utils::engine_helpers::{self, build_response};
 use crate::engine::utils::parse_rcode;
 use crate::matcher::RuntimeResponseMatcherWithOp;
 use crate::matcher::eval_match_chain;
-use crate::observe::{RuleMatched, RulePhase};
+use crate::observe::{RuleEvaluated, RuleMatched, RulePhase};
 
 use super::observation::{Observed, response_decision_kind};
 
@@ -977,20 +977,33 @@ pub(crate) async fn process_response_jump(
                             )
                         }; // guards are dropped here / 锁在此处释放
 
-                        if resp_match_ok
-                            && !response_matchers.is_empty()
+                        if !response_matchers.is_empty()
                             && let Some((observer, ctx)) = observed
                         {
-                            observer.rule_matched(
+                            observer.rule_evaluated(
                                 ctx,
-                                &RuleMatched {
+                                &RuleEvaluated {
                                     pipeline: &pipeline_id,
                                     rule: &rule_name,
                                     phase: RulePhase::Response,
-                                    decision: response_decision_kind(&response_actions_on_match),
-                                    fast_path: false,
+                                    matched: resp_match_ok,
+                                    matchers: response_matchers.len(),
                                 },
                             );
+                            if resp_match_ok {
+                                observer.rule_matched(
+                                    ctx,
+                                    &RuleMatched {
+                                        pipeline: &pipeline_id,
+                                        rule: &rule_name,
+                                        phase: RulePhase::Response,
+                                        decision: response_decision_kind(
+                                            &response_actions_on_match,
+                                        ),
+                                        fast_path: false,
+                                    },
+                                );
+                            }
                         }
 
                         let actions_to_run = if !response_actions_on_match.is_empty()

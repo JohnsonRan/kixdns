@@ -4,7 +4,7 @@ use std::net::SocketAddr;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use anyhow::Context;
 
@@ -25,13 +25,14 @@ use crate::config::Transport;
 use crate::matcher::RuntimePipelineConfig;
 use crate::matcher::advanced_rule::{compile_pipelines, fast_static_match_with_rule};
 use crate::observe::{
-    CacheHitKind, DecisionKind, EngineObserver, RequestContext, RequestOutcome, RequestStatus,
-    RuleMatched, RulePhase,
+    CacheHit, CacheHitKind, DecisionDetail, DecisionKind, DecisionMade, EngineObserver,
+    RequestContext, RequestOutcome, RequestStatus, RuleCacheLookup, RuleMatched, RulePhase,
 };
 use crate::proto_utils::parse_quick;
 
-use super::observation::{ObservedRequest, report_matched_rules};
+use super::observation::{ObservedRequest, report_decision, report_matched_rules};
 use super::response::build_fast_static_response;
+use super::rules::RuleCacheRecord;
 use super::types::{EngineInner, FastPathResponse, build_cache_namespaces};
 use super::utils::{engine_helpers, is_refreshing};
 #[cfg(test)]
@@ -78,14 +79,18 @@ impl PreParsedData {
 /// 快速路径上应答请求的来源，用于观察者上报。
 enum FastPathAnswer<'a> {
     /// Fresh response cache entry / 新鲜的响应缓存条目
-    Cache,
-    /// Compiled static rule matched directly / 编译后的静态规则直接命中
-    StaticRule(&'a str),
-    /// Rule cache entry holding a static decision / 规则缓存中的静态决策
-    CachedRules {
-        rules: &'a [Arc<str>],
-        deciding: Option<DecisionKind>,
+    Cache {
+        original_ttl: u32,
+        elapsed_secs: u32,
     },
+    /// Compiled static rule matched directly / 编译后的静态规则直接命中
+    StaticRule {
+        rule: &'a str,
+        rcode: ResponseCode,
+        answers: usize,
+    },
+    /// Rule cache entry holding a static decision / 规则缓存中的静态决策
+    CachedRules { record: &'a RuleCacheRecord },
 }
 
 // ============================================================================
@@ -305,19 +310,73 @@ impl Engine {
         observer.pipeline_selected(ctx, pipeline_id);
         observer.cache_lookup(ctx);
         match answer {
-            FastPathAnswer::Cache => observer.cache_hit(ctx, CacheHitKind::Fresh),
-            FastPathAnswer::StaticRule(rule) => observer.rule_matched(
+            FastPathAnswer::Cache {
+                original_ttl,
+                elapsed_secs,
+            } => observer.cache_hit(
                 ctx,
-                &RuleMatched {
-                    pipeline: pipeline_id,
-                    rule,
-                    phase: RulePhase::Request,
-                    decision: DecisionKind::Static,
-                    fast_path: true,
+                &CacheHit {
+                    kind: CacheHitKind::Fresh,
+                    remaining_ttl: Some(Duration::from_secs(
+                        original_ttl.saturating_sub(elapsed_secs) as u64,
+                    )),
+                    original_ttl: Some(Duration::from_secs(original_ttl as u64)),
                 },
             ),
-            FastPathAnswer::CachedRules { rules, deciding } => {
-                report_matched_rules(observer, ctx, pipeline_id, rules, deciding, true)
+            FastPathAnswer::StaticRule {
+                rule,
+                rcode,
+                answers,
+            } => {
+                observer.cache_miss(ctx);
+                observer.rule_matched(
+                    ctx,
+                    &RuleMatched {
+                        pipeline: pipeline_id,
+                        rule,
+                        phase: RulePhase::Request,
+                        decision: DecisionKind::Static,
+                        fast_path: true,
+                    },
+                );
+                observer.decision_made(
+                    ctx,
+                    &DecisionMade {
+                        pipeline: pipeline_id,
+                        rule: Some(rule),
+                        detail: DecisionDetail::Static { rcode, answers },
+                    },
+                );
+            }
+            FastPathAnswer::CachedRules { record } => {
+                observer.cache_miss(ctx);
+                observer.rule_cache_lookup(
+                    ctx,
+                    &RuleCacheLookup {
+                        pipeline: pipeline_id,
+                        hit: true,
+                        matched_rules: record.matched_rules.len(),
+                    },
+                );
+                let deciding_rule = record
+                    .decided_by_rule
+                    .then(|| record.matched_rules.last())
+                    .flatten();
+                report_matched_rules(
+                    observer,
+                    ctx,
+                    pipeline_id,
+                    &record.matched_rules,
+                    deciding_rule.map(|_| DecisionKind::Static),
+                    true,
+                );
+                report_decision(
+                    observer,
+                    ctx,
+                    pipeline_id,
+                    deciding_rule.map(AsRef::as_ref),
+                    &record.entry.decision,
+                );
             }
         }
         observer.request_finished(
@@ -508,7 +567,10 @@ impl Engine {
                             start,
                             &self.fast_path_context(peer, qname_str, qtype, qclass),
                             &pipeline_id,
-                            FastPathAnswer::Cache,
+                            FastPathAnswer::Cache {
+                                original_ttl: hit.original_ttl,
+                                elapsed_secs,
+                            },
                         );
                     }
                     return Ok(Some(FastPathResponse::CacheHit {
@@ -544,7 +606,11 @@ impl Engine {
                         start,
                         &self.fast_path_context(peer, qname_str, qtype, qclass),
                         &pipeline_id,
-                        FastPathAnswer::StaticRule(rule_name),
+                        FastPathAnswer::StaticRule {
+                            rule: rule_name,
+                            rcode,
+                            answers: answers.len(),
+                        },
                     );
                 }
                 return Ok(Some(FastPathResponse::Direct(resp)));
@@ -593,10 +659,7 @@ impl Engine {
                             start,
                             &self.fast_path_context(peer, qname_str, qtype, qclass),
                             &pipeline_id,
-                            FastPathAnswer::CachedRules {
-                                rules: &record.matched_rules,
-                                deciding: record.decided_by_rule.then_some(DecisionKind::Static),
-                            },
+                            FastPathAnswer::CachedRules { record: &record },
                         );
                     }
                     return Ok(Some(FastPathResponse::Direct(resp)));
@@ -967,6 +1030,12 @@ impl Engine {
                 }
             }
 
+            // The response cache had nothing usable for this request
+            // 响应缓存中没有本请求可用的条目
+            if !skip_cache && let Some(observed) = &observed {
+                observed.observer.cache_miss(&observed.ctx);
+            }
+
             // 优化：保持 Cow<str> 以延迟分配，避免不必要的 String 分配
             // Optimization: Keep Cow<str> to defer allocation, avoid unnecessary String allocation
             // 大部分情况下 qname_cow 是 Borrowed（零拷贝），只有快速解析失败时才是 Owned
@@ -1010,7 +1079,7 @@ impl Engine {
                             (Arc::from(cfg.settings.default_upstream.as_str()), None)
                         };
 
-                    Decision::Forward {
+                    let decision = Decision::Forward {
                         upstream,
                         pre_split_upstreams: pre_split,
                         response_matchers: Vec::new(),
@@ -1023,7 +1092,11 @@ impl Engine {
                         continue_on_match: false,
                         continue_on_miss: false,
                         allow_reuse: false,
+                    };
+                    if let Some((observer, ctx)) = observed_ctx {
+                        report_decision(observer, ctx, &pipeline_id, None, &decision);
                     }
+                    decision
                 }
             };
 
