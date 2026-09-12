@@ -6,6 +6,8 @@ use anyhow::Context;
 use anyhow::Result;
 use ipnet::IpNet;
 use serde::Deserialize;
+
+use crate::matcher::RuntimePipelineConfig;
 use tracing::info;
 
 #[derive(Debug, Clone, Deserialize)]
@@ -1175,6 +1177,77 @@ fn default_ecs_prefix_v6() -> u8 {
     56 // Common ISP allocation boundary
 }
 
+/// Version of the configuration schema this build understands. It changes
+/// only when the JSON shape changes incompatibly; tools pair it with
+/// [`capabilities`] instead of inferring field support from the crate version.
+/// 本构建理解的配置 schema 版本。仅在 JSON 结构不兼容变更时改变；工具应配合
+/// [`capabilities`] 使用，而不是根据 crate 版本推断字段支持。
+pub const SCHEMA_VERSION: &str = "1.0";
+
+/// Configuration features this build supports, as stable
+/// `config_<feature>_v<n>` identifiers (sorted). A name is only ever added or
+/// retired, never redefined, so configuration tools can gate individual
+/// fields on it. / 本构建支持的配置能力，稳定标识符 `config_<feature>_v<n>`（已排序）。
+/// 名称只增加或退役，不重定义，配置工具据此门控字段。
+const CAPABILITIES: &[&str] = &[
+    "config_cache_background_refresh_v1",
+    "config_doh_inbound_v1",
+    "config_ecs_v1",
+    "config_flow_control_v1",
+    "config_forward_multi_upstream_v1",
+    "config_geoip_v1",
+    "config_geosite_v1",
+    "config_jump_to_pipeline_v1",
+    "config_pipeline_select_v1",
+    "config_replace_txt_response_v1",
+    "config_response_actions_v1",
+    "config_serve_stale_v1",
+    "config_static_cname_response_v1",
+    "config_static_ip_multi_address_v1",
+    "config_static_ip_response_v1",
+    "config_static_response_v1",
+    "config_static_txt_response_v1",
+    "config_tcp_fallback_v1",
+    "config_transport_doh_v1",
+    "config_transport_doq_v1",
+    "config_transport_dot_v1",
+    "config_transport_tcp_udp_v1",
+    "config_upstream_url_prefix_v1",
+];
+
+/// Configuration features supported by this build; see [`CAPABILITIES`].
+pub fn capabilities() -> &'static [&'static str] {
+    CAPABILITIES
+}
+
+/// Summary of a configuration that passed [`validate`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct ValidationReport {
+    /// The configuration's `version` field, if present.
+    pub version: Option<String>,
+    /// Number of pipelines.
+    pub pipeline_count: usize,
+    /// Total number of rules across all pipelines.
+    pub rule_count: usize,
+}
+
+/// Validate configuration text exactly as the engine loads it: JSON parsing,
+/// normalisation and runtime compilation (matchers, regexes, CIDRs, timeout
+/// sanity). Errors carry their cause chain; JSON syntax errors include the
+/// line and column. / 按引擎加载配置的方式校验文本：JSON 解析、规范化与运行时编译。
+/// 错误带完整原因链；JSON 语法错误包含行列位置。
+pub fn validate(raw: &str) -> Result<ValidationReport> {
+    let cfg = parse_config(raw)?;
+    let version = cfg.version.clone();
+    let runtime = RuntimePipelineConfig::from_config(cfg).context("compile configuration")?;
+    Ok(ValidationReport {
+        version,
+        pipeline_count: runtime.pipelines.len(),
+        rule_count: runtime.pipelines.iter().map(|p| p.rules.len()).sum(),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::{Matcher, PipelineSelectorMatcher, ResponseMatcher};
@@ -1204,5 +1277,79 @@ mod tests {
             panic!("unexpected response matcher variant");
         };
         assert_eq!(country_codes, ["CN", "cloudflare"]);
+    }
+}
+
+#[cfg(test)]
+mod validation_tests {
+    use super::{SCHEMA_VERSION, capabilities, validate};
+
+    #[test]
+    fn validate_reports_counts_for_a_valid_config() {
+        let raw = r#"{
+            "version": "t1",
+            "settings": { "default_upstream": "1.1.1.1:53" },
+            "pipelines": [
+                {
+                    "id": "main",
+                    "rules": [
+                        { "name": "a", "matchers": [{ "type": "any" }], "actions": [{ "type": "allow" }] },
+                        {
+                            "name": "b",
+                            "matchers": [{ "type": "domain_suffix", "value": "example.com" }],
+                            "actions": [{ "type": "static_response", "rcode": "NXDOMAIN" }]
+                        }
+                    ]
+                },
+                { "id": "other", "rules": [] }
+            ]
+        }"#;
+        let report = validate(raw).expect("valid config");
+        assert_eq!(report.version.as_deref(), Some("t1"));
+        assert_eq!(report.pipeline_count, 2);
+        assert_eq!(report.rule_count, 2);
+    }
+
+    #[test]
+    fn validate_locates_json_syntax_errors() {
+        let err = validate("{\n  \"pipelines\": [\n").expect_err("truncated JSON");
+        let text = format!("{err:#}");
+        assert!(
+            text.contains("line 3"),
+            "error should carry a position: {text}"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_invalid_selector_cidr() {
+        let raw = r#"{
+            "pipeline_select": [{
+                "pipeline": "default",
+                "matchers": [{ "type": "client_ip", "cidr": "invalid" }]
+            }]
+        }"#;
+        assert!(validate(raw).is_err());
+    }
+
+    #[test]
+    fn validate_rejects_runtime_compilation_errors() {
+        let err =
+            validate(r#"{ "settings": { "cache_capacity": 0 } }"#).expect_err("zero capacity");
+        assert!(format!("{err:#}").contains("cache_capacity"));
+    }
+
+    #[test]
+    fn capabilities_are_sorted_unique_and_stable() {
+        let caps = capabilities();
+        assert!(caps.contains(&"config_static_cname_response_v1"));
+        assert!(
+            caps.iter()
+                .all(|c| c.starts_with("config_") && c.ends_with("_v1"))
+        );
+        let mut sorted = caps.to_vec();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(sorted, caps, "capabilities must be sorted and unique");
+        assert_eq!(SCHEMA_VERSION, "1.0");
     }
 }
