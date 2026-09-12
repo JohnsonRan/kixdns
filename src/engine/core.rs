@@ -1,5 +1,6 @@
+use std::path::Path;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, AtomicUsize};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use anyhow::Context;
@@ -16,6 +17,7 @@ use crate::matcher::RuntimePipelineConfig;
 use crate::matcher::advanced_rule::compile_pipelines;
 use crate::matcher::geoip::GeoIpManager;
 use crate::matcher::geosite::GeoSiteManager;
+use crate::observe::{ConfigLoaded, ConfigReloadFailed, EngineObserver};
 
 use super::concurrency::{FlowControlState, PermitManager};
 use super::rules::RuleCacheEntry;
@@ -32,6 +34,11 @@ pub struct Engine {
     pub(crate) dot_mux: Arc<DotMultiplexer>,
     pub(crate) doq_client: Arc<DoqClient>,
     pub listener_label: Arc<str>,
+    // Optional event sink; None keeps the request path free of event construction.
+    // 可选事件接收器；None 时请求路径不构造任何事件。
+    pub(crate) observer: Option<Arc<dyn EngineObserver>>,
+    // Active configuration generation: 1 at startup, +1 per reload / 当前配置代数：启动为 1，每次重载 +1
+    pub(crate) config_generation: Arc<AtomicU64>,
     // Rule execution result cache: Hash -> (Key, Decision) / 规则执行结果缓存：哈希 -> (键, 决策)
     // Key is stored to verify collisions / 存储键以验证冲突
     pub(crate) rule_cache: Cache<u64, RuleCacheEntry>,
@@ -93,8 +100,53 @@ pub struct Engine {
     pub(crate) background_refresh_rule: std::sync::OnceLock<Arc<crate::matcher::RuntimeRule>>,
 }
 
+/// Configures and constructs an [`Engine`]. Obtain one via [`Engine::builder`].
+pub struct EngineBuilder {
+    cfg: RuntimePipelineConfig,
+    listener_label: String,
+    observer: Option<Arc<dyn EngineObserver>>,
+}
+
+impl EngineBuilder {
+    /// Listener label used for `listener_label` pipeline selectors (default: `"default"`).
+    pub fn listener_label(mut self, label: impl Into<String>) -> Self {
+        self.listener_label = label.into();
+        self
+    }
+
+    /// Install an [`EngineObserver`] that receives engine events.
+    pub fn observer(mut self, observer: Arc<dyn EngineObserver>) -> Self {
+        self.observer = Some(observer);
+        self
+    }
+
+    /// Build the engine, initialising transports, caches and GeoIP/GeoSite data.
+    pub fn build(self) -> anyhow::Result<Engine> {
+        Engine::build(self.cfg, self.listener_label, self.observer)
+    }
+}
+
 impl Engine {
+    /// Start configuring an engine for `cfg`.
+    pub fn builder(cfg: RuntimePipelineConfig) -> EngineBuilder {
+        EngineBuilder {
+            cfg,
+            listener_label: "default".to_string(),
+            observer: None,
+        }
+    }
+
+    /// Build an engine without an observer. Equivalent to
+    /// `Engine::builder(cfg).listener_label(listener_label).build()`.
     pub fn new(cfg: RuntimePipelineConfig, listener_label: String) -> anyhow::Result<Self> {
+        Self::build(cfg, listener_label, None)
+    }
+
+    fn build(
+        cfg: RuntimePipelineConfig,
+        listener_label: String,
+        observer: Option<Arc<dyn EngineObserver>>,
+    ) -> anyhow::Result<Self> {
         // moka 缓存：容量由配置控制（默认 10000 条），最大生存时间由 cache_max_ttl 控制
         // moka cache capacity and max TTL are configurable via settings
         let cache_capacity = cfg.settings.cache_capacity;
@@ -363,6 +415,8 @@ impl Engine {
             dot_mux,
             doq_client,
             listener_label: Arc::from(listener_label),
+            observer,
+            config_generation: Arc::new(AtomicU64::new(1)),
             rule_cache,
             metrics_inflight: Arc::new(AtomicUsize::new(0)),
             metrics_total_requests: Arc::new(AtomicU64::new(0)),
@@ -420,5 +474,37 @@ impl Engine {
     /// Insert a cached entry / 插入缓存条目
     pub(crate) fn cache_insert(&self, hash: u64, entry: Arc<CacheEntry>) {
         self.cache.insert(hash, entry);
+    }
+
+    /// The observer installed via [`EngineBuilder::observer`], if any.
+    pub fn observer(&self) -> Option<&dyn EngineObserver> {
+        self.observer.as_deref()
+    }
+
+    /// Generation of the active configuration: `1` for the configuration the
+    /// engine was built with, incremented by every [`Engine::reload`].
+    pub fn config_generation(&self) -> u64 {
+        self.config_generation.load(Ordering::Relaxed)
+    }
+
+    /// Report to the observer that the active configuration was loaded from
+    /// `path` with contents `source`. Call it after construction and after
+    /// every successful [`Engine::reload`]; the file watcher does the latter.
+    pub fn notify_config_loaded(&self, path: &Path, source: &str) {
+        if let Some(observer) = &self.observer {
+            observer.config_loaded(&ConfigLoaded {
+                path,
+                generation: self.config_generation(),
+                source,
+            });
+        }
+    }
+
+    /// Report to the observer that reloading `path` failed with `error` and
+    /// the previous configuration stays active.
+    pub fn notify_config_reload_failed(&self, path: &Path, error: &str) {
+        if let Some(observer) = &self.observer {
+            observer.config_reload_failed(&ConfigReloadFailed { path, error });
+        }
     }
 }

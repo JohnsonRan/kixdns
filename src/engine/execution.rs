@@ -96,6 +96,7 @@ impl Engine {
             compiled_pipelines: compiled,
             pipeline_index,
         }));
+        self.config_generation.fetch_add(1, Ordering::Relaxed);
         // Cache keys include a per-pipeline configuration namespace. Changed
         // pipelines become unreachable immediately, while unchanged pipelines
         // keep their warm response and rule caches.

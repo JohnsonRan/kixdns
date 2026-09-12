@@ -13,7 +13,7 @@ pub mod upstream;
 pub mod utils;
 
 pub use concurrency::PermitManager;
-pub use core::Engine;
+pub use core::{Engine, EngineBuilder};
 pub use execution::PreParsedData;
 pub use matcher_adapter::*;
 pub use pipeline::select_pipeline;
