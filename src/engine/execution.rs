@@ -653,131 +653,51 @@ impl Engine {
         let qname_ref = &qname_cow;
         let start = std::time::Instant::now();
 
-        // Find pipeline_opt from pipeline_id / 从 pipeline_id 查找 pipeline_opt
-        let pipeline_opt = cfg
-            .pipeline_id_index
-            .get(pipeline_id.as_ref())
-            .and_then(|&idx| cfg.pipelines.get(idx));
+        // Everything below may return the response from several places.
+        // The async block funnels every exit through one point so the
+        // observer learns the outcome; the block is awaited immediately.
+        // 以下代码在多处返回响应；用 async 块包裹使所有出口汇聚到一处，便于观察者
+        // 获得请求结果。该块会被立即 await。
+        async {
+            // Find pipeline_opt from pipeline_id / 从 pipeline_id 查找 pipeline_opt
+            let pipeline_opt = cfg
+                .pipeline_id_index
+                .get(pipeline_id.as_ref())
+                .and_then(|&idx| cfg.pipelines.get(idx));
 
-        // Convert qname_ref to bytes for hash calculation / 将 qname_ref 转换为 bytes 进行哈希计算
-        let qname_bytes = qname_ref.as_bytes();
-        // Compute dedupe hash: use explicit hash for background refresh, or pre-computed ECS key,
-        // otherwise compute with ECS key from pipeline config
-        // 计算 dedupe hash：后台刷新用显式 hash，或用预计算 ECS key，否则从 pipeline 配置计算
-        let ecs_key = if explicit_cache_hash.is_some() {
-            None // explicit hash overrides; ecs_key not needed / 显式 hash 优先；不需要 ecs_key
-        } else {
-            pre_ecs_key.or_else(|| {
-                pipeline_opt.and_then(|p| {
-                    p.ecs
-                        .as_ref()
-                        .and_then(|mode| crate::ecs::EcsKey::from_pipeline_config(mode, peer.ip()))
+            // Convert qname_ref to bytes for hash calculation / 将 qname_ref 转换为 bytes 进行哈希计算
+            let qname_bytes = qname_ref.as_bytes();
+            // Compute dedupe hash: use explicit hash for background refresh, or pre-computed ECS key,
+            // otherwise compute with ECS key from pipeline config
+            // 计算 dedupe hash：后台刷新用显式 hash，或用预计算 ECS key，否则从 pipeline 配置计算
+            let ecs_key = if explicit_cache_hash.is_some() {
+                None // explicit hash overrides; ecs_key not needed / 显式 hash 优先；不需要 ecs_key
+            } else {
+                pre_ecs_key.or_else(|| {
+                    pipeline_opt.and_then(|p| {
+                        p.ecs.as_ref().and_then(|mode| {
+                            crate::ecs::EcsKey::from_pipeline_config(mode, peer.ip())
+                        })
+                    })
                 })
-            })
-        };
-        let dedupe_hash = if let Some(h) = explicit_cache_hash {
-            h
-        } else {
-            Self::calculate_cache_hash_for_dedupe(
-                state.cache_namespace(&pipeline_id),
-                &pipeline_id,
-                qname_bytes,
-                qtype,
-                qclass,
-                ecs_key.as_ref(),
-            )
-        };
-
-        // Background refresh: Skip cache lookup when skip_cache=true
-        // 后台刷新：当 skip_cache=true 时跳过缓存查找
-        if !skip_cache
-            && let Some(resp_bytes) = phases::check_cache(
-                self,
-                &phases::CacheLookupContext {
-                    state: &state,
-                    qname: qname_ref,
+            };
+            let dedupe_hash = if let Some(h) = explicit_cache_hash {
+                h
+            } else {
+                Self::calculate_cache_hash_for_dedupe(
+                    state.cache_namespace(&pipeline_id),
+                    &pipeline_id,
+                    qname_bytes,
                     qtype,
                     qclass,
-                    pipeline_id: &pipeline_id,
-                    dedupe_hash,
-                    tx_id,
-                    start,
-                    peer: &peer,
-                },
-            )
-        {
-            return Ok(resp_bytes);
-        }
+                    ecs_key.as_ref(),
+                )
+            };
 
-        // RFC 8767 Client Timeout: When serve_stale is enabled with client_timeout > 0,
-        // try upstream for client_timeout_ms before falling back to stale data.
-        // RFC 8767 客户端超时：当 serve_stale 启用且 client_timeout > 0 时，
-        // 先尝试上游查询 client_timeout_ms 毫秒，超时后返回过期数据。
-        // Corresponds to Unbound serve-expired-client-timeout
-        //
-        // Design: check_cache() already triggers spawn_background_refresh() for expired entries
-        // when client_timeout > 0. Here we poll the cache with 5ms intervals to detect
-        // when the background refresh completes. If client_timeout expires, serve stale.
-        // 设计：check_cache() 在 client_timeout > 0 且缓存过期时已触发 spawn_background_refresh。
-        // 这里以 5ms 间隔轮询缓存，检测后台刷新是否完成。超时则返回过期数据。
-        if !skip_cache && self.serve_stale && self.serve_stale_client_timeout_ms > 0 {
-            let has_stale = self
-                .cache
-                .get(&dedupe_hash)
-                .filter(|h| {
-                    h.qtype == u16::from(qtype)
-                        && h.pipeline_id.as_ref() == pipeline_id.as_ref()
-                        && h.qname.as_ref() == qname_ref
-                        && h.inserted_at.elapsed().as_secs() >= h.original_ttl as u64
-                        && h.rcode != ResponseCode::ServFail
-                        && h.rcode != ResponseCode::Refused
-                })
-                .is_some();
-
-            if has_stale {
-                let client_timeout =
-                    std::time::Duration::from_millis(self.serve_stale_client_timeout_ms);
-                let poll_interval = std::time::Duration::from_millis(5);
-                let wait_start = Instant::now();
-
-                // Poll cache for fresh data from background refresh
-                // 轮询缓存等待后台刷新带来的新鲜数据
-                while wait_start.elapsed() < client_timeout {
-                    tokio::time::sleep(poll_interval).await;
-                    // Check if background refresh put fresh data in cache
-                    let Some(fresh_hit) = self.cache.get(&dedupe_hash) else {
-                        break;
-                    };
-                    if fresh_hit.inserted_at.elapsed().as_secs() < fresh_hit.original_ttl as u64 {
-                        // Fresh data available! Serve it.
-                        if let Some(fresh_bytes) = phases::check_cache(
-                            self,
-                            &phases::CacheLookupContext {
-                                state: &state,
-                                qname: qname_ref,
-                                qtype,
-                                qclass,
-                                pipeline_id: &pipeline_id,
-                                dedupe_hash,
-                                tx_id,
-                                start,
-                                peer: &peer,
-                            },
-                        ) {
-                            tracing::debug!(
-                                event = "serve_fresh_after_client_wait",
-                                qname = %qname_ref,
-                                wait_ms = wait_start.elapsed().as_millis() as u64,
-                                "background refresh completed within client_timeout"
-                            );
-                            return Ok(fresh_bytes);
-                        }
-                    }
-                }
-
-                // Client timeout expired - serve stale response
-                // 客户端超时 - 返回过期缓存响应
-                if let Some(stale_bytes) = phases::check_stale_cache(
+            // Background refresh: Skip cache lookup when skip_cache=true
+            // 后台刷新：当 skip_cache=true 时跳过缓存查找
+            if !skip_cache
+                && let Some(resp_bytes) = phases::check_cache(
                     self,
                     &phases::CacheLookupContext {
                         state: &state,
@@ -790,284 +710,377 @@ impl Engine {
                         start,
                         peer: &peer,
                     },
-                ) {
-                    tracing::debug!(
-                        event = "serve_stale_on_client_timeout",
-                        qname = %qname_ref,
-                        qtype = ?qtype,
-                        timeout_ms = self.serve_stale_client_timeout_ms,
-                        client_ip = %peer.ip(),
-                        pipeline = %pipeline_id,
-                        "RFC 8767: client timeout expired, serving stale"
-                    );
-                    return Ok(stale_bytes);
-                }
-                // Stale entry evicted by moka - fall through to normal processing
-            }
-        }
-
-        // 优化：保持 Cow<str> 以延迟分配，避免不必要的 String 分配
-        // Optimization: Keep Cow<str> to defer allocation, avoid unnecessary String allocation
-        // 大部分情况下 qname_cow 是 Borrowed（零拷贝），只有快速解析失败时才是 Owned
-        // In most cases qname_cow is Borrowed (zero-copy), only Owned when quick parse fails
-        let qname = qname_cow;
-        let mut skip_rules: FxHashSet<Arc<str>> = FxHashSet::default();
-        let mut current_pipeline_id = pipeline_id.clone();
-        let mut current_uses_client_ip = pipeline_opt.map(|p| p.uses_client_ip).unwrap_or(false);
-        // Convert qname to bytes for hash calculation / 将 qname 转换为 bytes 进行哈希计算
-        let qname_bytes = qname.as_bytes();
-        // Reuse dedupe_hash from earlier computation (includes ECS key isolation)
-        // 复用之前计算的 dedupe_hash（已含 ECS key 隔离维度）
-        let mut dedupe_hash = dedupe_hash;
-        let mut reused_response: Option<ResponseContext> = None;
-
-        let mut decision = match pipeline_opt {
-            Some(p) => self.apply_rules(
-                &state,
-                p,
-                &RuleEvaluationContext::new(
-                    peer.ip(),
-                    &qname,
-                    qtype,
-                    qclass,
-                    edns_present,
-                    None,
-                    skip_cache,
-                ),
-            ),
-            None => {
-                // 使用预分割的默认 upstream 以支持并发查询 / Use pre-split default upstream for concurrent queries
-                let (upstream, pre_split) =
-                    if let Some(pre) = &cfg.settings.default_upstream_pre_split {
-                        (
-                            Arc::from(cfg.settings.default_upstream.as_str()),
-                            Some(pre.clone()),
-                        )
-                    } else {
-                        (Arc::from(cfg.settings.default_upstream.as_str()), None)
-                    };
-
-                Decision::Forward {
-                    upstream,
-                    pre_split_upstreams: pre_split,
-                    response_matchers: Vec::new(),
-                    response_matcher_operator: crate::config::MatchOperator::And,
-                    response_actions_on_match: Vec::new(),
-                    response_actions_on_miss: Vec::new(),
-                    rule_name: Arc::from("default"),
-                    transport: Some(Transport::Udp),
-                    ecs: None,
-                    continue_on_match: false,
-                    continue_on_miss: false,
-                    allow_reuse: false,
-                }
-            }
-        };
-
-        // DESIGN NOTE: InflightCleanupGuard safety analysis
-        // 设计说明：InflightCleanupGuard 安全性分析
-        //
-        // Safety Guarantee: No race condition exists
-        // 安全性保证：不存在竞态条件
-        //
-        // The guard is always used as a local stack variable (never shared via Arc/Mutex).
-        // Rust's ownership model guarantees that:
-        // - Mutable borrow via as_mut() (for defuse()) and Drop execution are mutually exclusive
-        // - The compiler prevents concurrent access at compile time
-        //
-        // 该守卫始终作为局部栈变量使用（从不通过 Arc/Mutex 共享）。
-        // Rust 所有权模型保证：
-        // - 通过 as_mut() 的可变借用（用于 defuse()）和 Drop 执行互斥
-        // - 编译器在编译期阻止并发访问
-        //
-        // This is a standard Rust RAII pattern that is safe and idiomatic.
-        // 这是标准的 Rust RAII 模式，安全且符合惯用法。
-
-        // jump_count must live outside 'decision_loop so it is not reset
-        // when Forward returns Continue and we re-enter the outer loop.
-        // Without this, the response_jump_limit could be bypassed via:
-        //   Jump → Forward(Continue) → [jump_count reset to 0] → Jump → …
-        let mut jump_count = 0;
-        'decision_loop: loop {
-            while let Decision::Jump { pipeline } = &decision {
-                jump_count += 1;
-                if jump_count > response_jump_limit {
-                    warn!("max jump limit reached");
-                    decision = Decision::Static {
-                        rcode: ResponseCode::ServFail,
-                        answers: Vec::new(),
-                    };
-                    break;
-                }
-                if let Some(&idx) = cfg.pipeline_id_index.get(pipeline.as_ref()) {
-                    let p = &cfg.pipelines[idx];
-                    current_pipeline_id = p.id.clone();
-                    current_uses_client_ip = p.uses_client_ip;
-                    // Must recompute ECS key + dedupe_hash: pipeline changed via Jump,
-                    // so the target pipeline's ECS config may differ from the source.
-                    // 必须重算 ECS key + dedupe_hash：pipeline 因 Jump 改变，
-                    // 目标 pipeline 的 ECS 配置可能与源 pipeline 不同。
-                    let jump_ecs_key = p
-                        .ecs
-                        .as_ref()
-                        .and_then(|mode| crate::ecs::EcsKey::from_pipeline_config(mode, peer.ip()));
-                    dedupe_hash = Self::calculate_cache_hash_for_dedupe(
-                        state.cache_namespace(&current_pipeline_id),
-                        &current_pipeline_id,
-                        qname_bytes,
-                        qtype,
-                        qclass,
-                        jump_ecs_key.as_ref(),
-                    );
-                    skip_rules.clear();
-                    decision = self.apply_rules(
-                        &state,
-                        p,
-                        &RuleEvaluationContext::new(
-                            peer.ip(),
-                            &qname,
-                            qtype,
-                            qclass,
-                            edns_present,
-                            None,
-                            skip_cache,
-                        ),
-                    );
-                } else {
-                    warn!("jump target pipeline not found: {}", pipeline);
-                    decision = Decision::Static {
-                        rcode: ResponseCode::ServFail,
-                        answers: Vec::new(),
-                    };
-                    break;
-                }
+                )
+            {
+                return Ok(resp_bytes);
             }
 
-            match decision {
-                Decision::Jump { .. } => {
-                    anyhow::bail!("unresolved pipeline jump");
-                }
-                Decision::Static { rcode, answers } => {
-                    return phases::handle_static_decision(
-                        self,
-                        &phases::StaticDecisionContext {
-                            packet,
-                            qname: &qname,
-                            qtype,
-                            pipeline_id: &current_pipeline_id,
-                            dedupe_hash,
-                            min_ttl,
-                            start,
-                            peer: &peer,
-                            uses_client_ip: current_uses_client_ip,
-                        },
-                        rcode,
-                        answers,
-                    );
-                }
-                Decision::Forward {
-                    upstream,
-                    pre_split_upstreams,
-                    response_matchers,
-                    response_matcher_operator: _,
-                    response_actions_on_match,
-                    response_actions_on_miss,
-                    rule_name,
-                    transport,
-                    ecs,
-                    continue_on_match: _,
-                    continue_on_miss: _,
-                    allow_reuse,
-                } => {
-                    let res = phases::handle_forward_decision(
-                        self,
-                        phases::ForwardDecisionContext {
-                            state: &state,
-                            packet,
-                            qname: &qname,
-                            qtype,
-                            qclass,
-                            tx_id,
-                            pipeline_id: &current_pipeline_id,
-                            rule_name: &rule_name,
-                            dedupe_hash,
-                            min_ttl,
-                            upstream_timeout,
-                            start,
-                            peer: &peer,
-                            skip_cache,
-                            upstream: &upstream,
-                            pre_split_upstreams: pre_split_upstreams.as_ref(),
-                            response_matchers: &response_matchers,
-                            response_actions_on_match: &response_actions_on_match,
-                            response_actions_on_miss: &response_actions_on_miss,
-                            transport,
-                            ecs: ecs.as_ref(),
-                            allow_reuse,
-                            reused_response: &mut reused_response,
-                        },
-                    )
-                    .await;
+            // RFC 8767 Client Timeout: When serve_stale is enabled with client_timeout > 0,
+            // try upstream for client_timeout_ms before falling back to stale data.
+            // RFC 8767 客户端超时：当 serve_stale 启用且 client_timeout > 0 时，
+            // 先尝试上游查询 client_timeout_ms 毫秒，超时后返回过期数据。
+            // Corresponds to Unbound serve-expired-client-timeout
+            //
+            // Design: check_cache() already triggers spawn_background_refresh() for expired entries
+            // when client_timeout > 0. Here we poll the cache with 5ms intervals to detect
+            // when the background refresh completes. If client_timeout expires, serve stale.
+            // 设计：check_cache() 在 client_timeout > 0 且缓存过期时已触发 spawn_background_refresh。
+            // 这里以 5ms 间隔轮询缓存，检测后台刷新是否完成。超时则返回过期数据。
+            if !skip_cache && self.serve_stale && self.serve_stale_client_timeout_ms > 0 {
+                let has_stale = self
+                    .cache
+                    .get(&dedupe_hash)
+                    .filter(|h| {
+                        h.qtype == u16::from(qtype)
+                            && h.pipeline_id.as_ref() == pipeline_id.as_ref()
+                            && h.qname.as_ref() == qname_ref
+                            && h.inserted_at.elapsed().as_secs() >= h.original_ttl as u64
+                            && h.rcode != ResponseCode::ServFail
+                            && h.rcode != ResponseCode::Refused
+                    })
+                    .is_some();
 
-                    match res {
-                        Ok(phases::ForwardResult::Success(bytes)) => return Ok(bytes),
-                        Ok(phases::ForwardResult::Continue(ctx)) => {
-                            reused_response = *ctx;
-                            skip_rules.insert(rule_name.clone());
-                            let skip_ref = if skip_rules.is_empty() {
-                                None
-                            } else {
-                                Some(&skip_rules)
-                            };
+                if has_stale {
+                    let client_timeout =
+                        std::time::Duration::from_millis(self.serve_stale_client_timeout_ms);
+                    let poll_interval = std::time::Duration::from_millis(5);
+                    let wait_start = Instant::now();
 
-                            let pipeline = if let Some(&idx) =
-                                cfg.pipeline_id_index.get(current_pipeline_id.as_ref())
-                            {
-                                &cfg.pipelines[idx]
-                            } else {
-                                warn!("pipeline missing while continuing: {}", current_pipeline_id);
-                                let req = Message::from_bytes(packet).context("parse request")?;
-                                return engine_helpers::build_servfail_response(&req);
-                            };
-
-                            decision = self.apply_rules(
-                                &state,
-                                pipeline,
-                                &RuleEvaluationContext::new(
-                                    peer.ip(),
-                                    &qname,
+                    // Poll cache for fresh data from background refresh
+                    // 轮询缓存等待后台刷新带来的新鲜数据
+                    while wait_start.elapsed() < client_timeout {
+                        tokio::time::sleep(poll_interval).await;
+                        // Check if background refresh put fresh data in cache
+                        let Some(fresh_hit) = self.cache.get(&dedupe_hash) else {
+                            break;
+                        };
+                        if fresh_hit.inserted_at.elapsed().as_secs() < fresh_hit.original_ttl as u64
+                        {
+                            // Fresh data available! Serve it.
+                            if let Some(fresh_bytes) = phases::check_cache(
+                                self,
+                                &phases::CacheLookupContext {
+                                    state: &state,
+                                    qname: qname_ref,
                                     qtype,
                                     qclass,
-                                    edns_present,
-                                    skip_ref,
-                                    skip_cache,
-                                ),
-                            );
-                            continue 'decision_loop;
+                                    pipeline_id: &pipeline_id,
+                                    dedupe_hash,
+                                    tx_id,
+                                    start,
+                                    peer: &peer,
+                                },
+                            ) {
+                                tracing::debug!(
+                                    event = "serve_fresh_after_client_wait",
+                                    qname = %qname_ref,
+                                    wait_ms = wait_start.elapsed().as_millis() as u64,
+                                    "background refresh completed within client_timeout"
+                                );
+                                return Ok(fresh_bytes);
+                            }
                         }
-                        Err(e) => {
-                            // A rule continued (response_actions_on_match: [continue])
-                            // and the next Forward attempt failed. The client must
-                            // receive a definitive answer, never silence: DNS clients
-                            // treat a missing reply as TIMEOUT. Return SERVFAIL so the
-                            // stub resolver can retry (RFC 1035).
-                            // 规则 continue 后，下一条 Forward 查询失败。必须给客户端
-                            // 一个确定性的响应而非静默：DNS 客户端会把无响应视为
-                            // TIMEOUT。返回 SERVFAIL 以便 stub resolver 重试。
-                            warn!(
-                                event = "continue_reforward_failed",
-                                error = %e,
-                                rule = %rule_name,
-                                "continue re-forward failed, returning SERVFAIL"
-                            );
-                            let req = Message::from_bytes(packet)
-                                .context("parse request for SERVFAIL")?;
-                            return engine_helpers::build_servfail_response(&req);
+                    }
+
+                    // Client timeout expired - serve stale response
+                    // 客户端超时 - 返回过期缓存响应
+                    if let Some(stale_bytes) = phases::check_stale_cache(
+                        self,
+                        &phases::CacheLookupContext {
+                            state: &state,
+                            qname: qname_ref,
+                            qtype,
+                            qclass,
+                            pipeline_id: &pipeline_id,
+                            dedupe_hash,
+                            tx_id,
+                            start,
+                            peer: &peer,
+                        },
+                    ) {
+                        tracing::debug!(
+                            event = "serve_stale_on_client_timeout",
+                            qname = %qname_ref,
+                            qtype = ?qtype,
+                            timeout_ms = self.serve_stale_client_timeout_ms,
+                            client_ip = %peer.ip(),
+                            pipeline = %pipeline_id,
+                            "RFC 8767: client timeout expired, serving stale"
+                        );
+                        return Ok(stale_bytes);
+                    }
+                    // Stale entry evicted by moka - fall through to normal processing
+                }
+            }
+
+            // 优化：保持 Cow<str> 以延迟分配，避免不必要的 String 分配
+            // Optimization: Keep Cow<str> to defer allocation, avoid unnecessary String allocation
+            // 大部分情况下 qname_cow 是 Borrowed（零拷贝），只有快速解析失败时才是 Owned
+            // In most cases qname_cow is Borrowed (zero-copy), only Owned when quick parse fails
+            let qname: &str = qname_ref;
+            let mut skip_rules: FxHashSet<Arc<str>> = FxHashSet::default();
+            let mut current_pipeline_id = pipeline_id.clone();
+            let mut current_uses_client_ip =
+                pipeline_opt.map(|p| p.uses_client_ip).unwrap_or(false);
+            // Convert qname to bytes for hash calculation / 将 qname 转换为 bytes 进行哈希计算
+            let qname_bytes = qname.as_bytes();
+            // Reuse dedupe_hash from earlier computation (includes ECS key isolation)
+            // 复用之前计算的 dedupe_hash（已含 ECS key 隔离维度）
+            let mut dedupe_hash = dedupe_hash;
+            let mut reused_response: Option<ResponseContext> = None;
+
+            let mut decision = match pipeline_opt {
+                Some(p) => self.apply_rules(
+                    &state,
+                    p,
+                    &RuleEvaluationContext::new(
+                        peer.ip(),
+                        qname,
+                        qtype,
+                        qclass,
+                        edns_present,
+                        None,
+                        skip_cache,
+                    ),
+                ),
+                None => {
+                    // 使用预分割的默认 upstream 以支持并发查询 / Use pre-split default upstream for concurrent queries
+                    let (upstream, pre_split) =
+                        if let Some(pre) = &cfg.settings.default_upstream_pre_split {
+                            (
+                                Arc::from(cfg.settings.default_upstream.as_str()),
+                                Some(pre.clone()),
+                            )
+                        } else {
+                            (Arc::from(cfg.settings.default_upstream.as_str()), None)
+                        };
+
+                    Decision::Forward {
+                        upstream,
+                        pre_split_upstreams: pre_split,
+                        response_matchers: Vec::new(),
+                        response_matcher_operator: crate::config::MatchOperator::And,
+                        response_actions_on_match: Vec::new(),
+                        response_actions_on_miss: Vec::new(),
+                        rule_name: Arc::from("default"),
+                        transport: Some(Transport::Udp),
+                        ecs: None,
+                        continue_on_match: false,
+                        continue_on_miss: false,
+                        allow_reuse: false,
+                    }
+                }
+            };
+
+            // DESIGN NOTE: InflightCleanupGuard safety analysis
+            // 设计说明：InflightCleanupGuard 安全性分析
+            //
+            // Safety Guarantee: No race condition exists
+            // 安全性保证：不存在竞态条件
+            //
+            // The guard is always used as a local stack variable (never shared via Arc/Mutex).
+            // Rust's ownership model guarantees that:
+            // - Mutable borrow via as_mut() (for defuse()) and Drop execution are mutually exclusive
+            // - The compiler prevents concurrent access at compile time
+            //
+            // 该守卫始终作为局部栈变量使用（从不通过 Arc/Mutex 共享）。
+            // Rust 所有权模型保证：
+            // - 通过 as_mut() 的可变借用（用于 defuse()）和 Drop 执行互斥
+            // - 编译器在编译期阻止并发访问
+            //
+            // This is a standard Rust RAII pattern that is safe and idiomatic.
+            // 这是标准的 Rust RAII 模式，安全且符合惯用法。
+
+            // jump_count must live outside 'decision_loop so it is not reset
+            // when Forward returns Continue and we re-enter the outer loop.
+            // Without this, the response_jump_limit could be bypassed via:
+            //   Jump → Forward(Continue) → [jump_count reset to 0] → Jump → …
+            let mut jump_count = 0;
+            'decision_loop: loop {
+                while let Decision::Jump { pipeline } = &decision {
+                    jump_count += 1;
+                    if jump_count > response_jump_limit {
+                        warn!("max jump limit reached");
+                        decision = Decision::Static {
+                            rcode: ResponseCode::ServFail,
+                            answers: Vec::new(),
+                        };
+                        break;
+                    }
+                    if let Some(&idx) = cfg.pipeline_id_index.get(pipeline.as_ref()) {
+                        let p = &cfg.pipelines[idx];
+                        current_pipeline_id = p.id.clone();
+                        current_uses_client_ip = p.uses_client_ip;
+                        // Must recompute ECS key + dedupe_hash: pipeline changed via Jump,
+                        // so the target pipeline's ECS config may differ from the source.
+                        // 必须重算 ECS key + dedupe_hash：pipeline 因 Jump 改变，
+                        // 目标 pipeline 的 ECS 配置可能与源 pipeline 不同。
+                        let jump_ecs_key = p.ecs.as_ref().and_then(|mode| {
+                            crate::ecs::EcsKey::from_pipeline_config(mode, peer.ip())
+                        });
+                        dedupe_hash = Self::calculate_cache_hash_for_dedupe(
+                            state.cache_namespace(&current_pipeline_id),
+                            &current_pipeline_id,
+                            qname_bytes,
+                            qtype,
+                            qclass,
+                            jump_ecs_key.as_ref(),
+                        );
+                        skip_rules.clear();
+                        decision = self.apply_rules(
+                            &state,
+                            p,
+                            &RuleEvaluationContext::new(
+                                peer.ip(),
+                                qname,
+                                qtype,
+                                qclass,
+                                edns_present,
+                                None,
+                                skip_cache,
+                            ),
+                        );
+                    } else {
+                        warn!("jump target pipeline not found: {}", pipeline);
+                        decision = Decision::Static {
+                            rcode: ResponseCode::ServFail,
+                            answers: Vec::new(),
+                        };
+                        break;
+                    }
+                }
+
+                match decision {
+                    Decision::Jump { .. } => {
+                        anyhow::bail!("unresolved pipeline jump");
+                    }
+                    Decision::Static { rcode, answers } => {
+                        return phases::handle_static_decision(
+                            self,
+                            &phases::StaticDecisionContext {
+                                packet,
+                                qname,
+                                qtype,
+                                pipeline_id: &current_pipeline_id,
+                                dedupe_hash,
+                                min_ttl,
+                                start,
+                                peer: &peer,
+                                uses_client_ip: current_uses_client_ip,
+                            },
+                            rcode,
+                            answers,
+                        );
+                    }
+                    Decision::Forward {
+                        upstream,
+                        pre_split_upstreams,
+                        response_matchers,
+                        response_matcher_operator: _,
+                        response_actions_on_match,
+                        response_actions_on_miss,
+                        rule_name,
+                        transport,
+                        ecs,
+                        continue_on_match: _,
+                        continue_on_miss: _,
+                        allow_reuse,
+                    } => {
+                        let res = phases::handle_forward_decision(
+                            self,
+                            phases::ForwardDecisionContext {
+                                state: &state,
+                                packet,
+                                qname,
+                                qtype,
+                                qclass,
+                                tx_id,
+                                pipeline_id: &current_pipeline_id,
+                                rule_name: &rule_name,
+                                dedupe_hash,
+                                min_ttl,
+                                upstream_timeout,
+                                start,
+                                peer: &peer,
+                                skip_cache,
+                                upstream: &upstream,
+                                pre_split_upstreams: pre_split_upstreams.as_ref(),
+                                response_matchers: &response_matchers,
+                                response_actions_on_match: &response_actions_on_match,
+                                response_actions_on_miss: &response_actions_on_miss,
+                                transport,
+                                ecs: ecs.as_ref(),
+                                allow_reuse,
+                                reused_response: &mut reused_response,
+                            },
+                        )
+                        .await;
+
+                        match res {
+                            Ok(phases::ForwardResult::Success(bytes)) => return Ok(bytes),
+                            Ok(phases::ForwardResult::Continue(ctx)) => {
+                                reused_response = *ctx;
+                                skip_rules.insert(rule_name.clone());
+                                let skip_ref = if skip_rules.is_empty() {
+                                    None
+                                } else {
+                                    Some(&skip_rules)
+                                };
+
+                                let pipeline = if let Some(&idx) =
+                                    cfg.pipeline_id_index.get(current_pipeline_id.as_ref())
+                                {
+                                    &cfg.pipelines[idx]
+                                } else {
+                                    warn!(
+                                        "pipeline missing while continuing: {}",
+                                        current_pipeline_id
+                                    );
+                                    let req =
+                                        Message::from_bytes(packet).context("parse request")?;
+                                    return engine_helpers::build_servfail_response(&req);
+                                };
+
+                                decision = self.apply_rules(
+                                    &state,
+                                    pipeline,
+                                    &RuleEvaluationContext::new(
+                                        peer.ip(),
+                                        qname,
+                                        qtype,
+                                        qclass,
+                                        edns_present,
+                                        skip_ref,
+                                        skip_cache,
+                                    ),
+                                );
+                                continue 'decision_loop;
+                            }
+                            Err(e) => {
+                                // A rule continued (response_actions_on_match: [continue])
+                                // and the next Forward attempt failed. The client must
+                                // receive a definitive answer, never silence: DNS clients
+                                // treat a missing reply as TIMEOUT. Return SERVFAIL so the
+                                // stub resolver can retry (RFC 1035).
+                                // 规则 continue 后，下一条 Forward 查询失败。必须给客户端
+                                // 一个确定性的响应而非静默：DNS 客户端会把无响应视为
+                                // TIMEOUT。返回 SERVFAIL 以便 stub resolver 重试。
+                                warn!(
+                                    event = "continue_reforward_failed",
+                                    error = %e,
+                                    rule = %rule_name,
+                                    "continue re-forward failed, returning SERVFAIL"
+                                );
+                                let req = Message::from_bytes(packet)
+                                    .context("parse request for SERVFAIL")?;
+                                return engine_helpers::build_servfail_response(&req);
+                            }
                         }
                     }
                 }
             }
         }
+        .await
     }
 
     pub(crate) async fn notify_inflight_waiters(&self, dedupe_hash: u64, bytes: &Bytes) {
