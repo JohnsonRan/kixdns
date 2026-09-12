@@ -120,6 +120,17 @@ pub struct RuleCacheEntry {
     pub expires_at: Option<Instant>,
 }
 
+/// Rule cache value: the cached decision plus the request-phase rules whose
+/// matchers matched while producing it (in evaluation order, the last one
+/// being the deciding rule). Rule cache hits replay them to observers.
+/// 规则缓存值：缓存的决策以及产生它时命中的请求阶段规则（按求值顺序，最后
+/// 一条为决定性规则）。规则缓存命中时向观察者回放。
+#[derive(Clone)]
+pub struct RuleCacheRecord {
+    pub entry: RuleCacheEntry,
+    pub matched_rules: Arc<[Arc<str>]>,
+}
+
 impl RuleCacheEntry {
     pub fn new(
         pipeline_id: Arc<str>,

@@ -20,7 +20,7 @@ use crate::matcher::geosite::GeoSiteManager;
 use crate::observe::{ConfigLoaded, ConfigReloadFailed, EngineObserver};
 
 use super::concurrency::{FlowControlState, PermitManager};
-use super::rules::RuleCacheEntry;
+use super::rules::RuleCacheRecord;
 use super::transport::{DohClient, DoqClient, DotMultiplexer, TcpMultiplexer, UdpClient};
 use super::types::{EngineInner, InflightMap, build_cache_namespaces};
 
@@ -41,7 +41,7 @@ pub struct Engine {
     pub(crate) config_generation: Arc<AtomicU64>,
     // Rule execution result cache: Hash -> (Key, Decision) / 规则执行结果缓存：哈希 -> (键, 决策)
     // Key is stored to verify collisions / 存储键以验证冲突
-    pub(crate) rule_cache: Cache<u64, RuleCacheEntry>,
+    pub(crate) rule_cache: Cache<u64, RuleCacheRecord>,
     // Runtime metrics for diagnosing concurrency and upstream latency / 运行时指标，用于诊断并发和上游延迟
     pub metrics_inflight: Arc<AtomicUsize>,
     pub metrics_total_requests: Arc<AtomicU64>,

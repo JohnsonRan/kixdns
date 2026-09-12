@@ -21,7 +21,9 @@ use crate::matcher::{
 use super::core::Engine;
 use super::matcher_adapter::{MatcherContext, matcher_matches};
 use super::rules::Decision;
-use super::rules::{RuleCacheEntry, calculate_rule_hash, contains_continue, fast_hash_str};
+use super::rules::{
+    RuleCacheEntry, RuleCacheRecord, calculate_rule_hash, contains_continue, fast_hash_str,
+};
 use super::types::EngineInner;
 use super::{make_static_cname_answer, make_static_ip_answer};
 
@@ -160,6 +162,7 @@ impl Engine {
         request: &RuleEvaluationContext<'_>,
         decision: Decision,
         include_ip: bool,
+        matched_rules: &[Arc<str>],
     ) {
         let RuleEvaluationContext {
             client_ip,
@@ -211,14 +214,17 @@ impl Engine {
         // Optimization: only include client_ip in cache entry when configured or required by rule
         self.rule_cache.insert(
             hash,
-            RuleCacheEntry {
-                pipeline_id,
-                qname_hash: fast_hash_str(qname),
-                qtype: u16::from(qtype),
-                qclass: u16::from(qclass),
-                client_ip: if include_ip { Some(client_ip) } else { None },
-                decision: Arc::new(decision),
-                expires_at,
+            RuleCacheRecord {
+                entry: RuleCacheEntry {
+                    pipeline_id,
+                    qname_hash: fast_hash_str(qname),
+                    qtype: u16::from(qtype),
+                    qclass: u16::from(qclass),
+                    client_ip: if include_ip { Some(client_ip) } else { None },
+                    decision: Arc::new(decision),
+                    expires_at,
+                },
+                matched_rules: Arc::from(matched_rules),
             },
         );
     }
@@ -252,7 +258,8 @@ impl Engine {
         );
         let allow_rule_cache_lookup = !skip_cache && skip_rules.is_none_or(|set| set.is_empty());
 
-        if allow_rule_cache_lookup && let Some(entry) = self.rule_cache.get(&rule_hash) {
+        if allow_rule_cache_lookup && let Some(record) = self.rule_cache.get(&rule_hash) {
+            let entry = &record.entry;
             // Check validity and clean up if expired
             // 检查有效性，如果过期则清理
             if !entry.is_valid() {
@@ -321,6 +328,11 @@ impl Engine {
             geosite_manager: Some(&self.geosite_manager),
         };
 
+        // Rules whose request matchers matched, in order; stored with the
+        // cached decision so rule cache hits can replay them to observers.
+        // 请求匹配器命中的规则（按顺序）；随决策一起缓存，供规则缓存命中时回放给观察者。
+        let mut matched_rules: SmallVec<[Arc<str>; 4]> = SmallVec::new();
+
         'rules: for idx in candidate_indices {
             let rule = match pipeline.rules.get(idx) {
                 Some(r) => r,
@@ -340,6 +352,7 @@ impl Engine {
             );
 
             if req_match {
+                matched_rules.push(rule.name.clone());
                 // Check for multiple Forward actions using pre-computed merge result.
                 // The merge was computed at config load time (Rule::compute_merged_forward),
                 // eliminating per-request FxHashSet + format! + join overhead.
@@ -367,6 +380,7 @@ impl Engine {
                         request,
                         d.clone(),
                         include_ip,
+                        &matched_rules,
                     );
                     return d;
                 }
@@ -387,6 +401,7 @@ impl Engine {
                                 request,
                                 d.clone(),
                                 include_ip,
+                                &matched_rules,
                             );
                             return d;
                         }
@@ -399,6 +414,7 @@ impl Engine {
                                 request,
                                 d.clone(),
                                 include_ip,
+                                &matched_rules,
                             );
                             return d;
                         }
@@ -412,6 +428,7 @@ impl Engine {
                                 request,
                                 d.clone(),
                                 include_ip,
+                                &matched_rules,
                             );
                             return d;
                         }
@@ -425,6 +442,7 @@ impl Engine {
                                 request,
                                 d.clone(),
                                 include_ip,
+                                &matched_rules,
                             );
                             return d;
                         }
@@ -449,6 +467,7 @@ impl Engine {
                                 request,
                                 d.clone(),
                                 include_ip,
+                                &matched_rules,
                             );
                             return d;
                         }
@@ -463,6 +482,7 @@ impl Engine {
                                 request,
                                 d.clone(),
                                 include_ip,
+                                &matched_rules,
                             );
                             return d;
                         }
@@ -500,6 +520,7 @@ impl Engine {
                                 request,
                                 d.clone(),
                                 include_ip,
+                                &matched_rules,
                             );
                             return d;
                         }
@@ -526,6 +547,7 @@ impl Engine {
                                     request,
                                     d.clone(),
                                     include_ip,
+                                    &matched_rules,
                                 );
                                 return d;
                             }
@@ -539,6 +561,7 @@ impl Engine {
                                 request,
                                 d.clone(),
                                 include_ip,
+                                &matched_rules,
                             );
                             return d;
                         }
@@ -573,6 +596,7 @@ impl Engine {
             request,
             d.clone(),
             include_ip,
+            &matched_rules,
         );
         d
     }

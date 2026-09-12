@@ -461,7 +461,8 @@ impl Engine {
                 peer.ip(),
                 include_ip_in_hash,
             );
-            if let Some(entry) = self.rule_cache.get(&rule_hash) {
+            if let Some(record) = self.rule_cache.get(&rule_hash) {
+                let entry = &record.entry;
                 // Check if entry is valid before using
                 // 在使用前检查条目是否有效
                 if !entry.is_valid() {
