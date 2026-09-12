@@ -13,6 +13,13 @@ use crate::observe::{
     RulePhase,
 };
 
+/// Observer and request context of the request being processed. The engine
+/// checks its `observer` field once per request and threads this pair to
+/// every reporting site, so those sites only test a local `Option`.
+/// 正在处理的请求的观察者与上下文。引擎每个请求只检查一次 observer 字段，
+/// 随后把这对引用传给各上报点，各处只需检查本地 Option。
+pub(crate) type Observed<'a> = Option<(&'a dyn EngineObserver, &'a RequestContext<'a>)>;
+
 /// Observer handle for one request. Reports `request_finished` when dropped,
 /// so a request whose future is dropped early (listener timeout) is reported
 /// as cancelled instead of vanishing.

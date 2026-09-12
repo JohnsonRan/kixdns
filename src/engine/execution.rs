@@ -790,7 +790,9 @@ impl Engine {
                 start,
             )
         });
-        let observed_ctx = observed.as_ref().map(|observed| &observed.ctx);
+        let observed_ctx = observed
+            .as_ref()
+            .map(|observed| (observed.observer, &observed.ctx));
         if let Some(observed) = &observed {
             observed.observer.request_started(&observed.ctx);
             observed

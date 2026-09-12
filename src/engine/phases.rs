@@ -1,7 +1,7 @@
 use super::Engine;
 use crate::cache::CacheEntry;
 use crate::config::{Action, Transport};
-use crate::engine::observation::response_decision_kind;
+use crate::engine::observation::{Observed, response_decision_kind};
 use crate::engine::response::{extract_ttl, extract_ttl_for_refresh};
 use crate::engine::rules::{self, ResponseActionResult, ResponseContext};
 use crate::engine::types::EngineInner;
@@ -9,7 +9,7 @@ use crate::engine::upstream::UpstreamFailure;
 use crate::engine::utils::InflightCleanupGuard;
 use crate::engine::utils::engine_helpers::{build_response, build_servfail_response_fast};
 use crate::matcher::{RuntimeResponseMatcherWithOp, eval_match_chain};
-use crate::observe::{CacheHitKind, RequestContext, RuleMatched, RulePhase};
+use crate::observe::{CacheHitKind, RuleMatched, RulePhase};
 use crate::proto_utils;
 use anyhow::Context;
 use bytes::{Bytes, BytesMut};
@@ -44,7 +44,7 @@ pub struct CacheLookupContext<'a> {
     pub peer: &'a std::net::SocketAddr,
     /// Observer context of the request; cache hits are reported through it.
     /// 所属请求的观察者上下文；缓存命中通过它上报。
-    pub observed: Option<&'a RequestContext<'a>>,
+    pub observed: Observed<'a>,
 }
 
 pub fn check_cache(engine: &Engine, context: &CacheLookupContext<'_>) -> Option<Bytes> {
@@ -173,7 +173,7 @@ pub fn check_cache(engine: &Engine, context: &CacheLookupContext<'_>) -> Option<
                     "RFC 8767: serving stale cache entry on TTL expiry"
                 );
 
-                if let Some((observer, ctx)) = engine.observer.as_deref().zip(observed) {
+                if let Some((observer, ctx)) = observed {
                     observer.cache_hit(ctx, CacheHitKind::Stale);
                 }
                 return Some(resp_bytes.freeze());
@@ -256,7 +256,7 @@ pub fn check_cache(engine: &Engine, context: &CacheLookupContext<'_>) -> Option<
                     "cache hit"
                 );
 
-                if let Some((observer, ctx)) = engine.observer.as_deref().zip(observed) {
+                if let Some((observer, ctx)) = observed {
                     observer.cache_hit(ctx, CacheHitKind::Fresh);
                 }
                 return Some(resp_bytes);
@@ -366,7 +366,7 @@ pub fn check_stale_cache(
                 );
             }
 
-            if let Some((observer, ctx)) = engine.observer.as_deref().zip(observed) {
+            if let Some((observer, ctx)) = observed {
                 observer.cache_hit(ctx, kind);
             }
             return Some(resp_bytes.freeze());
@@ -474,7 +474,7 @@ pub struct ForwardDecisionContext<'a> {
     pub allow_reuse: bool,
     pub reused_response: &'a mut Option<ResponseContext>,
     /// Observer context of the request / 所属请求的观察者上下文
-    pub observed: Option<&'a RequestContext<'a>>,
+    pub observed: Observed<'a>,
 }
 
 pub async fn handle_forward_decision(
@@ -749,7 +749,7 @@ pub async fn handle_forward_decision(
             if resp_match_ok
                 && !skip_cache
                 && !response_matchers.is_empty()
-                && let Some((observer, ctx)) = engine.observer.as_deref().zip(observed)
+                && let Some((observer, ctx)) = observed
             {
                 observer.rule_matched(
                     ctx,

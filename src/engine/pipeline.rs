@@ -20,14 +20,13 @@ use crate::matcher::{
 
 use super::core::Engine;
 use super::matcher_adapter::{MatcherContext, matcher_matches};
-use super::observation::{decision_kind, report_matched_rules};
+use super::observation::{Observed, decision_kind, report_matched_rules};
 use super::rules::Decision;
 use super::rules::{
     RuleCacheEntry, RuleCacheRecord, calculate_rule_hash, contains_continue, fast_hash_str,
 };
 use super::types::EngineInner;
 use super::{make_static_cname_answer, make_static_ip_answer};
-use crate::observe::RequestContext;
 
 /// Request and manager references required to select a runtime pipeline.
 pub struct PipelineSelectionContext<'a> {
@@ -123,7 +122,7 @@ pub struct RuleEvaluationContext<'a> {
     pub skip_cache: bool,
     /// Observer context of the request being evaluated; `None` disables
     /// rule-match events. / 所属请求的观察者上下文；None 时不上报规则命中。
-    pub observed: Option<&'a RequestContext<'a>>,
+    pub observed: Observed<'a>,
 }
 
 impl<'a> RuleEvaluationContext<'a> {
@@ -149,7 +148,7 @@ impl<'a> RuleEvaluationContext<'a> {
     }
 
     /// Attach the observer context of the request so rule matches are reported.
-    pub fn with_observed(mut self, observed: Option<&'a RequestContext<'a>>) -> Self {
+    pub fn with_observed(mut self, observed: Observed<'a>) -> Self {
         self.observed = observed;
         self
     }
@@ -279,7 +278,7 @@ impl Engine {
             if !entry.is_valid() {
                 self.rule_cache.remove(&rule_hash);
             } else if entry.matches(&pipeline.id, qname, qtype, qclass, client_ip, include_ip) {
-                if let Some((observer, ctx)) = self.observer.as_deref().zip(request.observed) {
+                if let Some((observer, ctx)) = request.observed {
                     report_matched_rules(
                         observer,
                         ctx,
@@ -316,7 +315,7 @@ impl Engine {
             allow_reuse: false,
         });
 
-        if let Some((observer, ctx)) = self.observer.as_deref().zip(request.observed) {
+        if let Some((observer, ctx)) = request.observed {
             report_matched_rules(
                 observer,
                 ctx,

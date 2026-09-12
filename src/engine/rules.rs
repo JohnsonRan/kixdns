@@ -27,9 +27,9 @@ use crate::engine::utils::engine_helpers::{self, build_response};
 use crate::engine::utils::parse_rcode;
 use crate::matcher::RuntimeResponseMatcherWithOp;
 use crate::matcher::eval_match_chain;
-use crate::observe::{RequestContext, RuleMatched, RulePhase};
+use crate::observe::{RuleMatched, RulePhase};
 
-use super::observation::response_decision_kind;
+use super::observation::{Observed, response_decision_kind};
 
 #[derive(Debug, Clone)]
 pub enum Decision {
@@ -280,7 +280,7 @@ pub(crate) async fn apply_response_actions(
 /// 带观察者上下文的 [`apply_response_actions`]，使响应阶段 forward 动作的上游尝试得以上报。
 pub(crate) async fn apply_response_actions_observed(
     mut ctx: ApplyResponseActionsContext<'_>,
-    observed: Option<&RequestContext<'_>>,
+    observed: Observed<'_>,
 ) -> anyhow::Result<ResponseActionResult> {
     const MAX_RESPONSE_FORWARDS: usize = 4;
     let mut forward_attempts = 0usize;
@@ -552,7 +552,7 @@ pub(crate) struct ResponseJumpContext<'a> {
     pub upstream_timeout: Duration,
     pub skip_cache: bool,
     /// Observer context of the request / 所属请求的观察者上下文
-    pub observed: Option<&'a RequestContext<'a>>,
+    pub observed: Observed<'a>,
 }
 
 pub(crate) async fn process_response_jump(
@@ -635,7 +635,7 @@ pub(crate) async fn process_response_jump(
             }
             return Ok(resp_bytes);
         };
-        if let Some((observer, ctx)) = engine.observer.as_deref().zip(observed) {
+        if let Some((observer, ctx)) = observed {
             observer.pipeline_selected(ctx, &pipeline.id);
         }
 
@@ -684,7 +684,7 @@ pub(crate) async fn process_response_jump(
                     .get(pipeline_id.as_ref())
                     .and_then(|&idx| cfg.pipelines.get(idx))
                 {
-                    if let Some((observer, ctx)) = engine.observer.as_deref().zip(observed) {
+                    if let Some((observer, ctx)) = observed {
                         observer.pipeline_selected(ctx, &next_pipeline.id);
                     }
                     ecs_key = next_pipeline
@@ -979,7 +979,7 @@ pub(crate) async fn process_response_jump(
 
                         if resp_match_ok
                             && !response_matchers.is_empty()
-                            && let Some((observer, ctx)) = engine.observer.as_deref().zip(observed)
+                            && let Some((observer, ctx)) = observed
                         {
                             observer.rule_matched(
                                 ctx,

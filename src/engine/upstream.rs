@@ -10,7 +10,9 @@ use tracing::debug;
 
 use super::Engine;
 use crate::config::Transport;
-use crate::observe::{RequestContext, UpstreamAttempt, UpstreamOutcome, UpstreamResult};
+use crate::observe::{UpstreamAttempt, UpstreamOutcome, UpstreamResult};
+
+use super::observation::Observed;
 
 /// Error indicating that all upstream attempts have been exhausted.
 /// 表示所有 upstream 尝试均已耗尽的错误。
@@ -241,12 +243,10 @@ pub async fn forward_upstream(
     timeout_dur: Duration,
     transport: Option<Transport>,
     pre_split_upstreams: Option<&std::sync::Arc<Vec<std::sync::Arc<str>>>>,
-    observed: Option<&RequestContext<'_>>,
+    observed: Observed<'_>,
 ) -> anyhow::Result<(Bytes, String)> {
     // 如果 transport 为 None，使用默认 UDP
     let default_transport = transport.unwrap_or(Transport::Udp);
-    // One observer check for the whole call / 整个调用只做一次观察者检查
-    let observed = engine.observer.as_deref().zip(observed);
 
     // 使用预分割数据或动态分割 / Use pre-split data or dynamic splitting
     // 使用 Arc<str> 避免克隆 / Use Arc<str> to avoid cloning
