@@ -96,14 +96,24 @@ pub trait EngineObserver: Send + Sync + 'static {
     /// evaluation or from a rule cache hit.
     fn decision_made(&self, ctx: &RequestContext<'_>, event: &DecisionMade<'_>) {}
 
-    /// The response cache was consulted for the request.
+    /// The response cache was consulted for the request. Exactly one
+    /// [`cache_hit`] or [`cache_miss`] follows, and neither is ever reported
+    /// without a preceding `cache_lookup` of the same request, so hits and
+    /// misses always add up to lookups. Background refresh requests bypass
+    /// the cache and report none of the three.
+    ///
+    /// [`cache_hit`]: EngineObserver::cache_hit
+    /// [`cache_miss`]: EngineObserver::cache_miss
     fn cache_lookup(&self, ctx: &RequestContext<'_>) {}
 
-    /// The response cache answered the request.
+    /// The response cache answered the request. Always paired with the
+    /// request's [`cache_lookup`].
+    ///
+    /// [`cache_lookup`]: EngineObserver::cache_lookup
     fn cache_hit(&self, ctx: &RequestContext<'_>, event: &CacheHit) {}
 
-    /// The response cache had no usable entry. Paired with [`cache_lookup`]:
-    /// every lookup ends in exactly one `cache_hit` or `cache_miss`.
+    /// The response cache had no usable entry. Always paired with the
+    /// request's [`cache_lookup`].
     ///
     /// [`cache_lookup`]: EngineObserver::cache_lookup
     fn cache_miss(&self, ctx: &RequestContext<'_>) {}

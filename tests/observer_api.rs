@@ -339,11 +339,12 @@ fn rcode_of(bytes: &[u8]) -> ResponseCode {
 }
 
 /// Minimal UDP upstream that answers every query with one A record of the
-/// given TTL. / 最小 UDP 上游：以给定 TTL 的一条 A 记录应答所有查询。
-async fn spawn_echo_upstream(ttl: u32) -> String {
+/// given TTL. Aborting the returned task closes its socket.
+/// 最小 UDP 上游：以给定 TTL 的一条 A 记录应答所有查询；中止返回的任务即关闭其 socket。
+async fn spawn_echo_upstream(ttl: u32) -> (String, tokio::task::JoinHandle<()>) {
     let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
     let addr = socket.local_addr().unwrap().to_string();
-    tokio::spawn(async move {
+    let task = tokio::spawn(async move {
         let mut buf = [0u8; 1500];
         while let Ok((n, peer)) = socket.recv_from(&mut buf).await {
             let Ok(request) = Message::from_bytes(&buf[..n]) else {
@@ -363,7 +364,7 @@ async fn spawn_echo_upstream(ttl: u32) -> String {
             let _ = socket.send_to(&response.to_vec().unwrap(), peer).await;
         }
     });
-    addr
+    (addr, task)
 }
 
 /// Request id of the first `Started` event whose query name matches.
@@ -788,7 +789,7 @@ async fn rule_cache_hits_replay_matched_rules() {
 
 #[tokio::test]
 async fn upstream_success_then_fresh_and_stale_cache_hits() {
-    let upstream = spawn_echo_upstream(1).await;
+    let (upstream, _echo) = spawn_echo_upstream(1).await;
     let raw = serde_json::json!({
         "settings": {
             "default_upstream": "127.0.0.1:9",
@@ -926,6 +927,110 @@ async fn upstream_success_then_fresh_and_stale_cache_hits() {
         "a stale hit is not a miss: {mine:#?}"
     );
     assert!(mine.contains(&finished(id)));
+}
+
+#[tokio::test]
+async fn background_refresh_reports_no_cache_events() {
+    // A stale entry whose upstream has gone away: the foreground request is
+    // served stale and spawns a background refresh, whose forward fails.
+    // 上游已消失的过期条目：前台请求返回过期缓存并触发后台刷新，刷新转发失败。
+    let (upstream, echo) = spawn_echo_upstream(1).await;
+    let raw = serde_json::json!({
+        "settings": {
+            "default_upstream": "127.0.0.1:9",
+            "min_ttl": 0,
+            "serve_stale": true,
+            "serve_stale_client_timeout_ms": 0,
+            "upstream_timeout_ms": 200,
+            "enable_tcp_fallback": false
+        },
+        "pipelines": [{
+            "id": "main",
+            "rules": [{
+                "name": "fwd",
+                "matchers": [{ "type": "any" }],
+                "actions": [{ "type": "forward", "upstream": upstream, "transport": "udp" }]
+            }]
+        }]
+    })
+    .to_string();
+    let (engine, recorder) = observed_engine(&raw);
+
+    engine
+        .handle_packet(&query("stale.example"), peer())
+        .await
+        .unwrap();
+    echo.abort();
+    tokio::time::sleep(Duration::from_millis(1200)).await;
+    recorder.drain();
+
+    engine
+        .handle_packet(&query("stale.example"), peer())
+        .await
+        .unwrap();
+    // Wait for the background refresh to run to completion / 等待后台刷新结束
+    assert!(
+        recorder
+            .wait_for(Duration::from_secs(5), |events| {
+                events.iter().any(|event| {
+                    matches!(
+                        event,
+                        Event::Finished { id, .. }
+                            if events.iter().any(|started| matches!(
+                                started,
+                                Event::Started { id: sid, background: true, .. } if sid == id
+                            ))
+                    )
+                })
+            })
+            .await,
+        "background refresh must finish: {:#?}",
+        recorder.events()
+    );
+
+    let events = recorder.drain();
+    let foreground = request_id_for(&events, "stale.example");
+    let background = events
+        .iter()
+        .find_map(|event| match event {
+            Event::Started {
+                id,
+                background: true,
+                ..
+            } => Some(*id),
+            _ => None,
+        })
+        .expect("background refresh request");
+    assert_ne!(foreground, background);
+
+    let foreground_events = events_of(&events, foreground);
+    assert!(foreground_events.contains(&Event::CacheLookup { id: foreground }));
+    assert!(foreground_events.iter().any(|event| matches!(
+        event,
+        Event::CacheHit {
+            kind: CacheHitKind::Stale,
+            ..
+        }
+    )));
+
+    let background_events = events_of(&events, background);
+    assert!(
+        background_events.iter().any(|event| matches!(
+            event,
+            Event::UpstreamResult {
+                outcome: UpstreamOutcome::Error,
+                ..
+            }
+        )),
+        "the refresh forward must fail: {background_events:#?}"
+    );
+    assert!(
+        !background_events.iter().any(|event| matches!(
+            event,
+            Event::CacheLookup { .. } | Event::CacheHit { .. } | Event::CacheMiss { .. }
+        )),
+        "a background refresh must report no cache events: {background_events:#?}"
+    );
 }
 
 #[tokio::test]

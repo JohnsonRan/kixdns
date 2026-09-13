@@ -1027,7 +1027,9 @@ pub async fn handle_forward_decision(
                         tx_id,
                         start,
                         peer,
-                        observed,
+                        // A background refresh never looked the cache up, so it
+                        // must not report a hit either / 后台刷新没有查过缓存，也不能上报命中
+                        observed: if skip_cache { None } else { observed },
                     },
                     CacheHitKind::StaleUpstreamFailure,
                 ) {
