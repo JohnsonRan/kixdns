@@ -1034,6 +1034,62 @@ async fn background_refresh_reports_no_cache_events() {
 }
 
 #[tokio::test]
+async fn concurrent_upstreams_report_the_loser_as_aborted() {
+    // One upstream answers at once, the other never does / 一个立即应答，一个黑洞
+    let (echo, _echo_task) = spawn_echo_upstream(60).await;
+    let blackhole_socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let blackhole = blackhole_socket.local_addr().unwrap().to_string();
+    let raw = serde_json::json!({
+        "settings": { "default_upstream": "127.0.0.1:9", "enable_tcp_fallback": false },
+        "pipelines": [{
+            "id": "main",
+            "rules": [{
+                "name": "race",
+                "matchers": [{ "type": "any" }],
+                "actions": [{
+                    "type": "forward",
+                    "upstream": format!("{echo},{blackhole}"),
+                    "transport": "udp"
+                }]
+            }]
+        }]
+    })
+    .to_string();
+    let (engine, recorder) = observed_engine(&raw);
+
+    let response = engine
+        .handle_packet(&query("race.example"), peer())
+        .await
+        .unwrap();
+    assert_eq!(rcode_of(&response), ResponseCode::NoError);
+    let events = recorder.drain();
+    let id = request_id_for(&events, "race.example");
+    let mine = events_of(&events, id);
+
+    let attempts: Vec<String> = mine
+        .iter()
+        .filter_map(|event| match event {
+            Event::UpstreamAttempt { upstream, .. } => Some(upstream.clone()),
+            _ => None,
+        })
+        .collect();
+    let results: Vec<(String, UpstreamOutcome)> = mine
+        .iter()
+        .filter_map(|event| match event {
+            Event::UpstreamResult {
+                upstream, outcome, ..
+            } => Some((upstream.clone(), *outcome)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(attempts, vec![echo.clone(), blackhole.clone()]);
+    assert_eq!(results.len(), 2, "one result per attempt: {mine:#?}");
+    assert!(results.contains(&(echo.clone(), UpstreamOutcome::Success)));
+    assert!(results.contains(&(blackhole.clone(), UpstreamOutcome::Aborted)));
+    drop(blackhole_socket);
+}
+
+#[tokio::test]
 async fn failed_upstream_is_reported_with_error() {
     let raw = serde_json::json!({
         "settings": {

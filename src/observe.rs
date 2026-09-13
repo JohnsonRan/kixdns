@@ -118,10 +118,16 @@ pub trait EngineObserver: Send + Sync + 'static {
     /// [`cache_lookup`]: EngineObserver::cache_lookup
     fn cache_miss(&self, ctx: &RequestContext<'_>) {}
 
-    /// A query is about to be sent to an upstream server.
+    /// A query is about to be sent to an upstream server. Every attempt is
+    /// followed by exactly one [`upstream_result`], including attempts that
+    /// lose a concurrent race ([`UpstreamOutcome::Aborted`]).
+    ///
+    /// [`upstream_result`]: EngineObserver::upstream_result
     fn upstream_attempt(&self, ctx: &RequestContext<'_>, event: &UpstreamAttempt<'_>) {}
 
-    /// An upstream attempt completed.
+    /// An upstream attempt completed; strictly one per [`upstream_attempt`].
+    ///
+    /// [`upstream_attempt`]: EngineObserver::upstream_attempt
     fn upstream_result(&self, ctx: &RequestContext<'_>, event: &UpstreamResult<'_>) {}
 
     /// A configuration became active: the initial load and every successful
@@ -364,6 +370,9 @@ pub enum UpstreamOutcome {
     Rejected,
     /// The attempt failed (timeout, transport error, task failure).
     Error,
+    /// The attempt was still in flight when another upstream of the same
+    /// concurrent set answered, and was cancelled.
+    Aborted,
 }
 
 /// A configuration became active.

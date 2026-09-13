@@ -380,6 +380,11 @@ pub async fn forward_upstream(
     // 使用 Bytes 实现低成本克隆（引用计数）而非 Vec 全量拷贝
     let packet_owned = Bytes::copy_from_slice(packet);
     let mut last_err: Option<anyhow::Error> = None;
+    // Attempts that have not reported a result yet, so losers of the race can
+    // be reported as aborted; only tracked for an observer.
+    // 尚未上报结果的尝试，用于把竞争失败者上报为已取消；仅在有观察者时跟踪。
+    let mut pending: Option<Vec<(String, Transport, std::time::Instant)>> =
+        observed.map(|_| Vec::new());
 
     // If any TCP/TCP+UDP upstream is present, avoid UDP->TCP fallback to prevent duplicate TCP sends
     // 如果同一批次已有 TCP/TCP+UDP 上游，禁用 UDP->TCP fallback，避免重复 TCP 发送
@@ -399,6 +404,14 @@ pub async fn forward_upstream(
                     transport: transport_for_task,
                 },
             );
+        }
+
+        if let Some(pending) = pending.as_mut() {
+            pending.push((
+                addr.to_string(),
+                transport_for_task,
+                std::time::Instant::now(),
+            ));
         }
 
         let engine = engine.clone();
@@ -469,6 +482,13 @@ pub async fn forward_upstream(
     while let Some(result) = tasks.join_next().await {
         match result {
             Ok((up_proto, addr, transport_for_task, res, dur)) => {
+                if let Some(pending) = pending.as_mut()
+                    && let Some(idx) = pending
+                        .iter()
+                        .position(|(a, t, _)| *a == addr && *t == transport_for_task)
+                {
+                    pending.swap_remove(idx);
+                }
                 // Report the outcome of this attempt / 上报本次尝试的结果
                 let report = |outcome: UpstreamOutcome,
                               rcode: Option<ResponseCode>,
@@ -517,6 +537,10 @@ pub async fn forward_upstream(
                                 .metrics_last_upstream_latency_ns
                                 .store(dur.as_nanos() as u64, Ordering::Relaxed);
 
+                            // The remaining attempts lose the race / 其余尝试竞争失败
+                            if let Some(pending) = pending.as_ref() {
+                                report_aborted(observed, pending);
+                            }
                             // 显式取消其他正在进行的任务
                             if !tasks.is_empty() {
                                 tasks.abort_all();
@@ -540,9 +564,34 @@ pub async fn forward_upstream(
         }
     }
 
+    // Attempts whose task never reported (join error) / 任务未能上报结果的尝试（join 错误）
+    if let Some(pending) = pending.as_ref() {
+        report_aborted(observed, pending);
+    }
+
     // 所有上游都失败 / All upstreams failed
     let err = last_err.unwrap_or_else(|| anyhow::anyhow!("all upstreams failed"));
     Err(anyhow::Error::new(UpstreamFailure::new(err)))
+}
+
+/// Report every attempt still in flight as aborted / 把仍在飞的尝试上报为已取消
+fn report_aborted(observed: Observed<'_>, pending: &[(String, Transport, std::time::Instant)]) {
+    if let Some((observer, ctx)) = observed {
+        for (upstream, transport, started) in pending {
+            observer.upstream_result(
+                ctx,
+                &UpstreamResult {
+                    upstream,
+                    transport: *transport,
+                    outcome: UpstreamOutcome::Aborted,
+                    latency: started.elapsed(),
+                    rcode: None,
+                    truncated: None,
+                    error: None,
+                },
+            );
+        }
+    }
 }
 
 /// UDP forwarder with hedged retry and TCP fallback for better tail latency.
