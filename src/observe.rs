@@ -58,6 +58,11 @@ pub trait EngineObserver: Send + Sync + 'static {
     /// A client request entered the engine. Emitted exactly once per request,
     /// including background refresh requests (see
     /// [`RequestContext::background_refresh`]).
+    ///
+    /// Requests answered on the synchronous fast path have their whole
+    /// lifecycle reported in one batch at the answering site, so the moment a
+    /// callback arrives says nothing about when that step happened; take
+    /// timings from [`RequestOutcome::latency`], not from callback arrival.
     fn request_started(&self, ctx: &RequestContext<'_>) {}
 
     /// The request left the engine. Paired with [`request_started`]; also
