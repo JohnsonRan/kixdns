@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
@@ -7,6 +7,7 @@ use anyhow::Context;
 use arc_swap::ArcSwap;
 use dashmap::{DashMap, DashSet};
 use moka::sync::Cache;
+use parking_lot::Mutex;
 use rustc_hash::{FxBuildHasher, FxHashMap};
 use tracing::{info, warn};
 
@@ -39,6 +40,10 @@ pub struct Engine {
     pub(crate) observer: Option<Arc<dyn EngineObserver>>,
     // Active configuration generation: 1 at startup, +1 per reload / 当前配置代数：启动为 1，每次重载 +1
     pub(crate) config_generation: Arc<AtomicU64>,
+    // Serialises reloads so the stored state, the generation and the
+    // config_loaded event of one reload cannot interleave with another's.
+    // 串行化重载，使一次重载的状态存储、代数分配与 config_loaded 事件不与另一次交错。
+    pub(crate) reload_lock: Arc<Mutex<()>>,
     // Rule execution result cache: Hash -> (Key, Decision) / 规则执行结果缓存：哈希 -> (键, 决策)
     // Key is stored to verify collisions / 存储键以验证冲突
     pub(crate) rule_cache: Cache<u64, RuleCacheRecord>,
@@ -105,6 +110,7 @@ pub struct EngineBuilder {
     cfg: RuntimePipelineConfig,
     listener_label: String,
     observer: Option<Arc<dyn EngineObserver>>,
+    config_source: Option<(PathBuf, String)>,
 }
 
 impl EngineBuilder {
@@ -120,9 +126,27 @@ impl EngineBuilder {
         self
     }
 
-    /// Build the engine, initialising transports, caches and GeoIP/GeoSite data.
+    /// Record where the initial configuration came from, so the
+    /// `config_loaded` event reported by [`build`] carries the path and text.
+    ///
+    /// [`build`]: EngineBuilder::build
+    pub fn config_source(mut self, path: impl Into<PathBuf>, source: impl Into<String>) -> Self {
+        self.config_source = Some((path.into(), source.into()));
+        self
+    }
+
+    /// Build the engine, initialising transports, caches and GeoIP/GeoSite
+    /// data, and report the initial configuration (generation `1`) to the
+    /// observer.
     pub fn build(self) -> anyhow::Result<Engine> {
-        Engine::build(self.cfg, self.listener_label, self.observer)
+        let engine = Engine::build(self.cfg, self.listener_label, self.observer)?;
+        let source = self.config_source.as_ref();
+        engine.report_config_loaded(
+            1,
+            source.map(|(path, _)| path.as_path()),
+            source.map(|(_, text)| text.as_str()),
+        );
+        Ok(engine)
     }
 }
 
@@ -133,13 +157,14 @@ impl Engine {
             cfg,
             listener_label: "default".to_string(),
             observer: None,
+            config_source: None,
         }
     }
 
     /// Build an engine without an observer. Equivalent to
     /// `Engine::builder(cfg).listener_label(listener_label).build()`.
     pub fn new(cfg: RuntimePipelineConfig, listener_label: String) -> anyhow::Result<Self> {
-        Self::build(cfg, listener_label, None)
+        Self::builder(cfg).listener_label(listener_label).build()
     }
 
     fn build(
@@ -417,6 +442,7 @@ impl Engine {
             listener_label: Arc::from(listener_label),
             observer,
             config_generation: Arc::new(AtomicU64::new(1)),
+            reload_lock: Arc::new(Mutex::new(())),
             rule_cache,
             metrics_inflight: Arc::new(AtomicUsize::new(0)),
             metrics_total_requests: Arc::new(AtomicU64::new(0)),
@@ -487,14 +513,18 @@ impl Engine {
         self.config_generation.load(Ordering::Relaxed)
     }
 
-    /// Report to the observer that the active configuration was loaded from
-    /// `path` with contents `source`. Call it after construction and after
-    /// every successful [`Engine::reload`]; the file watcher does the latter.
-    pub fn notify_config_loaded(&self, path: &Path, source: &str) {
+    /// Report a configuration that just became active under `generation`.
+    /// 上报刚以 `generation` 生效的配置。
+    pub(crate) fn report_config_loaded(
+        &self,
+        generation: u64,
+        path: Option<&Path>,
+        source: Option<&str>,
+    ) {
         if let Some(observer) = &self.observer {
             observer.config_loaded(&ConfigLoaded {
                 path,
-                generation: self.config_generation(),
+                generation,
                 source,
             });
         }

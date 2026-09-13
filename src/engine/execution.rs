@@ -1,6 +1,7 @@
 use rustc_hash::{FxHashMap, FxHashSet, FxHasher};
 use std::hash::{Hash, Hasher};
 use std::net::SocketAddr;
+use std::path::Path;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -106,7 +107,27 @@ use super::pipeline::{PipelineSelectionContext, RuleEvaluationContext, select_pi
 
 impl Engine {
     /// Reload configuration and update compiled pipelines / 重新加载配置并更新编译后的管线
+    ///
+    /// Allocates the next configuration generation and reports `config_loaded`
+    /// (without path or source) in the same call; use [`Engine::reload_from`]
+    /// when the configuration came from a file.
     pub fn reload(&self, new_cfg: RuntimePipelineConfig) {
+        self.apply_config(new_cfg, None, None);
+    }
+
+    /// Like [`Engine::reload`], additionally telling the observer which file
+    /// (`path`) and text (`source`) the configuration came from.
+    /// 同 [`Engine::reload`]，并把配置来源文件与文本告知观察者。
+    pub fn reload_from(&self, new_cfg: RuntimePipelineConfig, path: &Path, source: &str) {
+        self.apply_config(new_cfg, Some(path), Some(source));
+    }
+
+    fn apply_config(
+        &self,
+        new_cfg: RuntimePipelineConfig,
+        path: Option<&Path>,
+        source: Option<&str>,
+    ) {
         let compiled = compile_pipelines(&new_cfg);
         // Build O(1) compiled pipeline lookup index / 构建 O(1) 编译管道查找索引
         let pipeline_index: FxHashMap<Arc<str>, usize> = compiled
@@ -114,13 +135,18 @@ impl Engine {
             .enumerate()
             .map(|(i, p)| (p.id.clone(), i))
             .collect();
+        // Store, generation and event stay together under the reload lock, so
+        // the reported generation is the one this reload allocated.
+        // 存储、代数与事件在重载锁内一起完成，事件中的代数就是本次分配的值。
+        let _reload_guard = self.reload_lock.lock();
         self.state.store(Arc::new(EngineInner {
             cache_namespaces: build_cache_namespaces(&new_cfg),
             pipeline: new_cfg,
             compiled_pipelines: compiled,
             pipeline_index,
         }));
-        self.config_generation.fetch_add(1, Ordering::Relaxed);
+        let generation = self.config_generation.fetch_add(1, Ordering::Relaxed) + 1;
+        self.report_config_loaded(generation, path, source);
         // Cache keys include a per-pipeline configuration namespace. Changed
         // pipelines become unreachable immediately, while unchanged pipelines
         // keep their warm response and rule caches.

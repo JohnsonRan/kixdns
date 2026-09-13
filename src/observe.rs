@@ -130,8 +130,8 @@ pub trait EngineObserver: Send + Sync + 'static {
     /// [`upstream_attempt`]: EngineObserver::upstream_attempt
     fn upstream_result(&self, ctx: &RequestContext<'_>, event: &UpstreamResult<'_>) {}
 
-    /// A configuration became active: the initial load and every successful
-    /// hot reload.
+    /// A configuration became active: the initial load (`build`) and every
+    /// successful `reload` / `reload_from`.
     fn config_loaded(&self, event: &ConfigLoaded<'_>) {}
 
     /// A hot reload was rejected; the previous configuration stays active.
@@ -375,18 +375,22 @@ pub enum UpstreamOutcome {
     Aborted,
 }
 
-/// A configuration became active.
+/// A configuration became active. Reported by `Engine::builder(..).build()`
+/// with generation `1` and by every `Engine::reload` / `Engine::reload_from`
+/// with the generation that call allocated, so generations are strictly
+/// increasing and never skip or repeat.
 #[derive(Debug, Clone, Copy)]
 #[non_exhaustive]
 pub struct ConfigLoaded<'a> {
-    /// Path the configuration was read from.
-    pub path: &'a Path,
+    /// Path the configuration was read from, when the loader supplied it
+    /// (`EngineBuilder::config_source`, `Engine::reload_from`).
+    pub path: Option<&'a Path>,
     /// Monotonic generation counter: `1` for the initial configuration,
     /// incremented by every successful reload.
     pub generation: u64,
-    /// Raw configuration text as read from `path`. Observers that need a
-    /// fingerprint derive it from this text.
-    pub source: &'a str,
+    /// Raw configuration text, when the loader supplied it. Observers that
+    /// need a fingerprint derive it from this text.
+    pub source: Option<&'a str>,
 }
 
 /// A hot reload failed and the previous configuration remains active.
@@ -569,9 +573,9 @@ impl EngineObserver for TracingObserver {
         tracing::debug!(
             target: TRACE_TARGET,
             event = "config_loaded",
-            path = %event.path.display(),
+            path = event.path.map(|path| tracing::field::display(path.display())),
             generation = event.generation,
-            source_bytes = event.source.len(),
+            source_bytes = event.source.map(str::len),
             "config loaded"
         );
     }
@@ -683,9 +687,9 @@ mod tests {
                 },
             );
             observer.config_loaded(&ConfigLoaded {
-                path: Path::new("config/pipeline.json"),
+                path: Some(Path::new("config/pipeline.json")),
                 generation: 1,
-                source: "{}",
+                source: Some("{}"),
             });
             observer.config_reload_failed(&ConfigReloadFailed {
                 path: Path::new("config/pipeline.json"),

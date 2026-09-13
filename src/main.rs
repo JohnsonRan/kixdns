@@ -158,13 +158,13 @@ async fn run_dns_server(
 
     // --debug installs the reference observer so engine events show up under
     // the kixdns::observe tracing target / --debug 安装参考观察者，引擎事件出现在 kixdns::observe 目标下
-    let mut builder = Engine::builder(cfg).listener_label(listener_label.clone());
+    let mut builder = Engine::builder(cfg)
+        .listener_label(listener_label.clone())
+        .config_source(&config, config_source);
     if debug {
         builder = builder.observer(Arc::new(TracingObserver));
     }
     let engine = builder.build().context("initialize DNS engine")?;
-    engine.notify_config_loaded(&config, &config_source);
-    drop(config_source);
 
     watcher::spawn(config.clone(), engine.clone());
 

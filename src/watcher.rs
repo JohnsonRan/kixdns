@@ -33,8 +33,7 @@ pub fn spawn(path: PathBuf, engine: Engine) {
             });
             match loaded {
                 Some((new_cfg, raw)) => {
-                    engine.reload(new_cfg);
-                    engine.notify_config_loaded(&path, &raw);
+                    engine.reload_from(new_cfg, &path, &raw);
                     info!(target = "watcher", path = %path.display(), "config reloaded");
                 }
                 None => engine.notify_config_reload_failed(

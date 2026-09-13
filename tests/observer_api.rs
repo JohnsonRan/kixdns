@@ -142,8 +142,8 @@ enum Event {
     },
     ConfigLoaded {
         generation: u64,
-        path: PathBuf,
-        source: String,
+        path: Option<PathBuf>,
+        source: Option<String>,
     },
     ConfigReloadFailed {
         path: PathBuf,
@@ -289,8 +289,8 @@ impl EngineObserver for Recorder {
     fn config_loaded(&self, event: &ConfigLoaded<'_>) {
         self.push(Event::ConfigLoaded {
             generation: event.generation,
-            path: event.path.to_path_buf(),
-            source: event.source.to_string(),
+            path: event.path.map(Path::to_path_buf),
+            source: event.source.map(str::to_string),
         });
     }
 
@@ -460,6 +460,52 @@ async fn builder_defaults_match_engine_new() {
     assert_eq!(observed.listener_label.as_ref(), "edge");
     observed.reload(runtime_config(&raw));
     assert_eq!(observed.config_generation(), 2);
+}
+
+#[tokio::test]
+async fn reload_events_carry_the_generation_they_allocated() {
+    let v1 = static_config("192.0.2.1");
+    let v2 = static_config("192.0.2.2");
+    let v3 = static_config("192.0.2.3");
+    let path = Path::new("/etc/kixdns/pipeline.json");
+    let (engine, recorder) = observed_engine(&v1);
+    assert_eq!(
+        recorder.drain(),
+        vec![Event::ConfigLoaded {
+            generation: 1,
+            path: None,
+            source: None,
+        }],
+        "build reports the initial configuration"
+    );
+
+    engine.reload_from(runtime_config(&v2), path, &v2);
+    assert_eq!(engine.config_generation(), 2);
+    engine.reload_from(runtime_config(&v3), path, &v3);
+    assert_eq!(engine.config_generation(), 3);
+    engine.reload(runtime_config(&v1));
+    assert_eq!(engine.config_generation(), 4);
+
+    assert_eq!(
+        recorder.drain(),
+        vec![
+            Event::ConfigLoaded {
+                generation: 2,
+                path: Some(path.to_path_buf()),
+                source: Some(v2),
+            },
+            Event::ConfigLoaded {
+                generation: 3,
+                path: Some(path.to_path_buf()),
+                source: Some(v3),
+            },
+            Event::ConfigLoaded {
+                generation: 4,
+                path: None,
+                source: None,
+            },
+        ]
+    );
 }
 
 #[tokio::test]
@@ -1196,14 +1242,19 @@ async fn hot_reload_reports_success_and_failure() {
     let v1 = static_config("192.0.2.1");
     std::fs::write(&path, &v1).unwrap();
 
-    let (engine, recorder) = observed_engine(&v1);
-    engine.notify_config_loaded(&path, &v1);
+    let recorder = Arc::new(Recorder::default());
+    let engine = Engine::builder(runtime_config(&v1))
+        .listener_label("edge")
+        .observer(recorder.clone())
+        .config_source(&path, &v1)
+        .build()
+        .expect("build engine");
     assert_eq!(
         recorder.drain(),
         vec![Event::ConfigLoaded {
             generation: 1,
-            path: path.clone(),
-            source: v1.clone(),
+            path: Some(path.clone()),
+            source: Some(v1.clone()),
         }]
     );
 
@@ -1222,7 +1273,9 @@ async fn hot_reload_reports_success_and_failure() {
                     matches!(
                         event,
                         Event::ConfigLoaded { generation, path: p, source }
-                            if *generation >= 2 && p == &path && source == &v2
+                            if *generation >= 2
+                                && p.as_deref() == Some(path.as_path())
+                                && source.as_deref() == Some(v2.as_str())
                     )
                 })
             })
