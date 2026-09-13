@@ -53,6 +53,14 @@ use crate::config::Transport;
 ///
 /// Hooks run synchronously on the request path; implementations must be
 /// cheap and must never block.
+///
+/// [`config_loaded`] runs while the engine holds its reload lock. An
+/// implementation must not call `Engine::reload` or `Engine::reload_from`
+/// from inside it, directly or indirectly: the call would block on the lock
+/// it is already under, and every later reload from any thread would block
+/// behind it, leaving the engine on its current configuration for good.
+///
+/// [`config_loaded`]: EngineObserver::config_loaded
 #[allow(unused_variables)]
 pub trait EngineObserver: Send + Sync + 'static {
     /// A client request entered the engine. Emitted exactly once per request,
@@ -137,6 +145,10 @@ pub trait EngineObserver: Send + Sync + 'static {
 
     /// A configuration became active: the initial load (`build`) and every
     /// successful `reload` / `reload_from`.
+    ///
+    /// Runs inside the engine's reload lock. Never call `Engine::reload` or
+    /// `Engine::reload_from` from here, directly or indirectly: the reload
+    /// path of the whole engine would block permanently.
     fn config_loaded(&self, event: &ConfigLoaded<'_>) {}
 
     /// A hot reload was rejected; the previous configuration stays active.

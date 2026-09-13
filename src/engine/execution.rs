@@ -111,6 +111,10 @@ impl Engine {
     /// Allocates the next configuration generation and reports `config_loaded`
     /// (without path or source) in the same call; use [`Engine::reload_from`]
     /// when the configuration came from a file.
+    ///
+    /// The observer's `config_loaded` runs under the engine's reload lock, so
+    /// it must not call `reload` / `reload_from` itself, directly or
+    /// indirectly; doing so blocks this call and every later reload forever.
     pub fn reload(&self, new_cfg: RuntimePipelineConfig) {
         self.apply_config(new_cfg, None, None);
     }
@@ -118,6 +122,10 @@ impl Engine {
     /// Like [`Engine::reload`], additionally telling the observer which file
     /// (`path`) and text (`source`) the configuration came from.
     /// 同 [`Engine::reload`]，并把配置来源文件与文本告知观察者。
+    ///
+    /// The observer's `config_loaded` runs under the engine's reload lock, so
+    /// it must not call `reload` / `reload_from` itself, directly or
+    /// indirectly; doing so blocks this call and every later reload forever.
     pub fn reload_from(&self, new_cfg: RuntimePipelineConfig, path: &Path, source: &str) {
         self.apply_config(new_cfg, Some(path), Some(source));
     }
