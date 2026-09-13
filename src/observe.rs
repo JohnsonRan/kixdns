@@ -265,8 +265,11 @@ pub enum DecisionDetail<'a> {
     Forward {
         /// Configured upstream string (may list several addresses).
         upstream: &'a str,
-        /// Configured transport; `None` when each address carries its own
-        /// protocol prefix.
+        /// Transport the forwarder will use for every listed address, or
+        /// `None` when a single value cannot describe the list: any address
+        /// carries its own `scheme://` prefix, so the addresses need not share
+        /// one transport. The per-address transport is reported by
+        /// [`UpstreamAttempt::transport`].
         transport: Option<Transport>,
     },
     /// Processing continues in another pipeline.
