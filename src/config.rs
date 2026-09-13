@@ -1,4 +1,5 @@
 use std::fs;
+use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -739,7 +740,64 @@ impl Rule {
     }
 }
 
+/// Listener endpoints resolved from [`GlobalSettings`], exactly as the server
+/// binds them. / 从 [`GlobalSettings`] 解析出的监听端点，与服务器实际绑定的一致。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ListenerConfig {
+    /// UDP listener address (`bind_udp`).
+    pub udp: SocketAddr,
+    /// TCP listener address (`bind_tcp`).
+    pub tcp: SocketAddr,
+    /// DoH listener, present when `bind_doh` is set.
+    pub doh: Option<DohListenerConfig>,
+}
+
+/// Inbound DoH listener settings with the TLS material it requires.
+/// 入站 DoH 监听设置及其所需的 TLS 材料。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DohListenerConfig {
+    /// DoH listener address (`bind_doh`).
+    pub bind: SocketAddr,
+    /// PEM certificate path (`doh_tls_cert`).
+    pub tls_cert: String,
+    /// PEM private key path (`doh_tls_key`).
+    pub tls_key: String,
+    /// HTTP path served (`doh_path`).
+    pub path: String,
+}
+
 impl GlobalSettings {
+    /// Parse the listener addresses and check the DoH prerequisites the way
+    /// server startup does; a configuration that fails here cannot be served.
+    /// Both the server and [`validate`] call this.
+    /// 按服务器启动的方式解析监听地址并检查 DoH 前置条件；此处失败的配置无法启动。
+    /// 服务器与 [`validate`] 都调用它。
+    pub fn listeners(&self) -> anyhow::Result<ListenerConfig> {
+        let udp: SocketAddr = self.bind_udp.parse().context("parse bind addr")?;
+        let tcp: SocketAddr = self.bind_tcp.parse().context("parse tcp bind addr")?;
+        let doh = match &self.bind_doh {
+            Some(bind_doh) => {
+                let bind: SocketAddr = bind_doh.parse().context("parse doh bind addr")?;
+                let tls_cert = self
+                    .doh_tls_cert
+                    .clone()
+                    .context("doh_tls_cert is required when bind_doh is set")?;
+                let tls_key = self
+                    .doh_tls_key
+                    .clone()
+                    .context("doh_tls_key is required when bind_doh is set")?;
+                Some(DohListenerConfig {
+                    bind,
+                    tls_cert,
+                    tls_key,
+                    path: self.doh_path.clone(),
+                })
+            }
+            None => None,
+        };
+        Ok(ListenerConfig { udp, tcp, doh })
+    }
+
     /// 预分割默认 upstream 字符串以优化性能（在配置加载时调用）/ Pre-split default upstream string for performance (call during config loading)
     #[inline]
     pub fn pre_split_default_upstream(&mut self) {
@@ -1189,15 +1247,18 @@ pub struct ValidationReport {
     pub rule_count: usize,
 }
 
-/// Validate configuration text exactly as the engine loads it: JSON parsing,
-/// normalisation and runtime compilation (matchers, regexes, CIDRs, timeout
-/// sanity). Errors carry their cause chain; JSON syntax errors include the
-/// line and column. / 按引擎加载配置的方式校验文本：JSON 解析、规范化与运行时编译。
-/// 错误带完整原因链；JSON 语法错误包含行列位置。
+/// Validate configuration text exactly as the server loads it: JSON parsing,
+/// normalisation, runtime compilation (matchers, regexes, CIDRs, timeout
+/// sanity) and the listener checks done at startup
+/// ([`GlobalSettings::listeners`]: bind addresses and DoH TLS material).
+/// Errors carry their cause chain; JSON syntax errors include the line and
+/// column. / 按服务器加载配置的方式校验文本：JSON 解析、规范化、运行时编译以及
+/// 启动时的监听检查（绑定地址与 DoH TLS 材料）。错误带完整原因链；JSON 语法错误包含行列位置。
 pub fn validate(raw: &str) -> Result<ValidationReport> {
     let cfg = parse_config(raw)?;
     let version = cfg.version.clone();
     let runtime = RuntimePipelineConfig::from_config(cfg).context("compile configuration")?;
+    runtime.settings.listeners().context("validate listeners")?;
     Ok(ValidationReport {
         version,
         pipeline_count: runtime.pipelines.len(),
@@ -1286,6 +1347,41 @@ mod validation_tests {
             }]
         }"#;
         assert!(validate(raw).is_err());
+    }
+
+    #[test]
+    fn validate_rejects_configs_the_server_cannot_bind() {
+        // Each row: settings JSON and whether the server would start with it
+        // 每行：settings JSON 以及服务器能否以此启动
+        let cases = [
+            (r#"{ "bind_udp": "not-an-address" }"#, false),
+            (r#"{ "bind_tcp": "999.999.999.999:53" }"#, false),
+            (
+                r#"{ "bind_doh": "::not::an::ip::", "doh_tls_cert": "c.pem", "doh_tls_key": "k.pem" }"#,
+                false,
+            ),
+            (r#"{ "bind_udp": "127.0.0.1:99999" }"#, false),
+            (r#"{ "bind_udp": "127.0.0.1:5353" }"#, true),
+            (r#"{ "bind_doh": "127.0.0.1:8443" }"#, false),
+            (
+                r#"{ "bind_doh": "127.0.0.1:8443", "doh_tls_cert": "c.pem", "doh_tls_key": "k.pem" }"#,
+                true,
+            ),
+        ];
+        for (settings, expected_ok) in cases {
+            let raw = format!(r#"{{ "settings": {settings} }}"#);
+            let validated = validate(&raw);
+            let started = crate::matcher::RuntimePipelineConfig::from_config(
+                super::parse_config(&raw).expect("parse"),
+            )
+            .and_then(|runtime| runtime.settings.listeners());
+            assert_eq!(validated.is_ok(), expected_ok, "validate({settings})");
+            assert_eq!(
+                validated.is_ok(),
+                started.is_ok(),
+                "validate() and startup must agree on {settings}"
+            );
+        }
     }
 
     #[test]

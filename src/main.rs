@@ -126,35 +126,15 @@ async fn run_dns_server(
 
     let (cfg, config_source) = load_config_with_source(&config).context("load initial config")?;
     let cfg = RuntimePipelineConfig::from_config(cfg).context("compile matchers")?;
-    let bind_addr: SocketAddr = cfg.settings.bind_udp.parse().context("parse bind addr")?;
-    let bind_tcp: SocketAddr = cfg
-        .settings
-        .bind_tcp
-        .parse()
-        .context("parse tcp bind addr")?;
-
-    // 在 cfg 被 move 到 Engine 之前提取 DoH 配置
-    // Extract DoH config before cfg is moved into Engine
-    let doh_config: Option<(SocketAddr, String, String, String)> =
-        if let Some(ref bind_doh) = cfg.settings.bind_doh {
-            let addr: SocketAddr = bind_doh.parse().context("parse doh bind addr")?;
-            let cert = cfg
-                .settings
-                .doh_tls_cert
-                .as_ref()
-                .context("doh_tls_cert is required when bind_doh is set")?
-                .clone();
-            let key = cfg
-                .settings
-                .doh_tls_key
-                .as_ref()
-                .context("doh_tls_key is required when bind_doh is set")?
-                .clone();
-            let path = cfg.settings.doh_path.clone();
-            Some((addr, cert, key, path))
-        } else {
-            None
-        };
+    // Listener addresses and DoH prerequisites, checked exactly as
+    // config::validate does / 监听地址与 DoH 前置条件，检查方式与 config::validate 一致
+    let listeners = cfg.settings.listeners()?;
+    let bind_addr = listeners.udp;
+    let bind_tcp = listeners.tcp;
+    // 在 cfg 被 move 到 Engine 之前提取 DoH 配置 / Extract DoH config before cfg is moved into Engine
+    let doh_config: Option<(SocketAddr, String, String, String)> = listeners
+        .doh
+        .map(|doh| (doh.bind, doh.tls_cert, doh.tls_key, doh.path));
 
     // --debug installs the reference observer so engine events show up under
     // the kixdns::observe tracing target / --debug 安装参考观察者，引擎事件出现在 kixdns::observe 目标下
