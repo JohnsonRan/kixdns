@@ -1177,49 +1177,6 @@ fn default_ecs_prefix_v6() -> u8 {
     56 // Common ISP allocation boundary
 }
 
-/// Version of the configuration schema this build understands. It changes
-/// only when the JSON shape changes incompatibly; tools pair it with
-/// [`capabilities`] instead of inferring field support from the crate version.
-/// 本构建理解的配置 schema 版本。仅在 JSON 结构不兼容变更时改变；工具应配合
-/// [`capabilities`] 使用，而不是根据 crate 版本推断字段支持。
-pub const SCHEMA_VERSION: &str = "1.0";
-
-/// Configuration features this build supports, as stable
-/// `config_<feature>_v<n>` identifiers (sorted). A name is only ever added or
-/// retired, never redefined, so configuration tools can gate individual
-/// fields on it. / 本构建支持的配置能力，稳定标识符 `config_<feature>_v<n>`（已排序）。
-/// 名称只增加或退役，不重定义，配置工具据此门控字段。
-const CAPABILITIES: &[&str] = &[
-    "config_cache_background_refresh_v1",
-    "config_doh_inbound_v1",
-    "config_ecs_v1",
-    "config_flow_control_v1",
-    "config_forward_multi_upstream_v1",
-    "config_geoip_v1",
-    "config_geosite_v1",
-    "config_jump_to_pipeline_v1",
-    "config_pipeline_select_v1",
-    "config_replace_txt_response_v1",
-    "config_response_actions_v1",
-    "config_serve_stale_v1",
-    "config_static_cname_response_v1",
-    "config_static_ip_multi_address_v1",
-    "config_static_ip_response_v1",
-    "config_static_response_v1",
-    "config_static_txt_response_v1",
-    "config_tcp_fallback_v1",
-    "config_transport_doh_v1",
-    "config_transport_doq_v1",
-    "config_transport_dot_v1",
-    "config_transport_tcp_udp_v1",
-    "config_upstream_url_prefix_v1",
-];
-
-/// Configuration features supported by this build; see [`CAPABILITIES`].
-pub fn capabilities() -> &'static [&'static str] {
-    CAPABILITIES
-}
-
 /// Summary of a configuration that passed [`validate`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
@@ -1282,7 +1239,7 @@ mod tests {
 
 #[cfg(test)]
 mod validation_tests {
-    use super::{SCHEMA_VERSION, capabilities, validate};
+    use super::validate;
 
     #[test]
     fn validate_reports_counts_for_a_valid_config() {
@@ -1336,20 +1293,5 @@ mod validation_tests {
         let err =
             validate(r#"{ "settings": { "cache_capacity": 0 } }"#).expect_err("zero capacity");
         assert!(format!("{err:#}").contains("cache_capacity"));
-    }
-
-    #[test]
-    fn capabilities_are_sorted_unique_and_stable() {
-        let caps = capabilities();
-        assert!(caps.contains(&"config_static_cname_response_v1"));
-        assert!(
-            caps.iter()
-                .all(|c| c.starts_with("config_") && c.ends_with("_v1"))
-        );
-        let mut sorted = caps.to_vec();
-        sorted.sort_unstable();
-        sorted.dedup();
-        assert_eq!(sorted, caps, "capabilities must be sorted and unique");
-        assert_eq!(SCHEMA_VERSION, "1.0");
     }
 }
