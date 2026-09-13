@@ -350,26 +350,26 @@ impl Engine {
             }
             FastPathAnswer::CachedRules { record } => {
                 observer.cache_miss(ctx);
+                let recorded = record.matched_rules.as_deref();
                 observer.rule_cache_lookup(
                     ctx,
                     &RuleCacheLookup {
                         pipeline: pipeline_id,
                         hit: true,
-                        matched_rules: record.matched_rules.len(),
+                        matched_rules: recorded.map_or(0, <[Arc<str>]>::len),
                     },
                 );
-                let deciding_rule = record
-                    .decided_by_rule
-                    .then(|| record.matched_rules.last())
-                    .flatten();
-                report_matched_rules(
-                    observer,
-                    ctx,
-                    pipeline_id,
-                    &record.matched_rules,
-                    deciding_rule.map(|_| DecisionKind::Static),
-                    true,
-                );
+                let deciding_rule = record.decided_by_rule.then(|| recorded?.last()).flatten();
+                if let Some(rules) = recorded {
+                    report_matched_rules(
+                        observer,
+                        ctx,
+                        pipeline_id,
+                        rules,
+                        deciding_rule.map(|_| DecisionKind::Static),
+                        true,
+                    );
+                }
                 report_decision(
                     observer,
                     ctx,

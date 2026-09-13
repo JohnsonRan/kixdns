@@ -131,7 +131,9 @@ pub struct RuleCacheEntry {
 #[derive(Clone)]
 pub struct RuleCacheRecord {
     pub entry: RuleCacheEntry,
-    pub matched_rules: Arc<[Arc<str>]>,
+    /// Recorded only when an observer is installed; `None` otherwise, so the
+    /// rule cache costs nothing extra without one. / 仅在安装了观察者时记录，否则为 None。
+    pub matched_rules: Option<Arc<[Arc<str>]>>,
     /// `false` when no rule decided and the default upstream applied.
     /// 无规则决定、使用默认上游时为 false。
     pub decided_by_rule: bool,

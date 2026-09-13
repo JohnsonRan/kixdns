@@ -237,7 +237,7 @@ impl Engine {
                     decision: Arc::new(decision),
                     expires_at,
                 },
-                matched_rules: Arc::from(matched_rules),
+                matched_rules: request.observed.map(|_| Arc::from(matched_rules)),
                 decided_by_rule,
             },
         );
@@ -280,26 +280,26 @@ impl Engine {
                 self.rule_cache.remove(&rule_hash);
             } else if entry.matches(&pipeline.id, qname, qtype, qclass, client_ip, include_ip) {
                 if let Some((observer, ctx)) = request.observed {
+                    let recorded = record.matched_rules.as_deref();
                     observer.rule_cache_lookup(
                         ctx,
                         &RuleCacheLookup {
                             pipeline: &pipeline.id,
                             hit: true,
-                            matched_rules: record.matched_rules.len(),
+                            matched_rules: recorded.map_or(0, <[Arc<str>]>::len),
                         },
                     );
-                    let deciding_rule = record
-                        .decided_by_rule
-                        .then(|| record.matched_rules.last())
-                        .flatten();
-                    report_matched_rules(
-                        observer,
-                        ctx,
-                        &pipeline.id,
-                        &record.matched_rules,
-                        deciding_rule.map(|_| decision_kind(&entry.decision)),
-                        false,
-                    );
+                    let deciding_rule = record.decided_by_rule.then(|| recorded?.last()).flatten();
+                    if let Some(rules) = recorded {
+                        report_matched_rules(
+                            observer,
+                            ctx,
+                            &pipeline.id,
+                            rules,
+                            deciding_rule.map(|_| decision_kind(&entry.decision)),
+                            false,
+                        );
+                    }
                     report_decision(
                         observer,
                         ctx,
@@ -486,7 +486,11 @@ impl Engine {
             }
 
             if req_match {
-                matched_rules.push(rule.name.clone());
+                // Names are only needed for observers; skip the clone otherwise
+                // 规则名只有观察者需要，无观察者时不做克隆
+                if request.observed.is_some() {
+                    matched_rules.push(rule.name.clone());
+                }
                 // Check for multiple Forward actions using pre-computed merge result.
                 // The merge was computed at config load time (Rule::compute_merged_forward),
                 // eliminating per-request FxHashSet + format! + join overhead.
@@ -631,5 +635,81 @@ impl Engine {
         }
 
         None
+    }
+}
+
+#[cfg(test)]
+mod observer_rule_cache_tests {
+    use std::sync::Arc;
+
+    use hickory_proto::op::{Message, MessageType, OpCode, Query};
+    use hickory_proto::rr::{Name, RecordType};
+
+    use crate::config::PipelineConfig;
+    use crate::engine::Engine;
+    use crate::matcher::RuntimePipelineConfig;
+    use crate::observe::NoopObserver;
+
+    fn runtime() -> RuntimePipelineConfig {
+        let raw = serde_json::json!({
+            "settings": { "default_upstream": "127.0.0.1:9", "min_ttl": 0 },
+            "pipelines": [{
+                "id": "main",
+                "rules": [{
+                    "name": "block",
+                    "matchers": [{ "type": "any" }],
+                    "actions": [{ "type": "static_response", "rcode": "NXDOMAIN" }]
+                }]
+            }]
+        });
+        let cfg: PipelineConfig = serde_json::from_value(raw).expect("parse config");
+        RuntimePipelineConfig::from_config(cfg).expect("runtime config")
+    }
+
+    fn query() -> Vec<u8> {
+        let mut message = Message::new(1, MessageType::Query, OpCode::Query);
+        message.add_query(Query::query(
+            Name::from_str_relaxed("example.com").unwrap(),
+            RecordType::A,
+        ));
+        message.to_vec().unwrap()
+    }
+
+    /// Collect the `matched_rules` of every rule cache record after one request.
+    async fn recorded_rules(engine: Engine) -> Vec<Option<usize>> {
+        engine
+            .handle_packet(&query(), "127.0.0.1:53000".parse().unwrap())
+            .await
+            .expect("static answer");
+        engine.rule_cache.run_pending_tasks();
+        engine
+            .rule_cache
+            .iter()
+            .map(|(_, record)| record.matched_rules.as_ref().map(|rules| rules.len()))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn rule_cache_records_no_rule_names_without_observer() {
+        let engine = Engine::new(runtime(), "test".to_string()).expect("engine");
+        let records = recorded_rules(engine).await;
+        assert!(
+            !records.is_empty(),
+            "the request must populate the rule cache"
+        );
+        assert!(
+            records.iter().all(Option::is_none),
+            "matched_rules must stay None without an observer: {records:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn rule_cache_records_rule_names_with_observer() {
+        let engine = Engine::builder(runtime())
+            .observer(Arc::new(NoopObserver))
+            .build()
+            .expect("engine");
+        let records = recorded_rules(engine).await;
+        assert_eq!(records, vec![Some(1)]);
     }
 }
