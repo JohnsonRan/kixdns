@@ -289,34 +289,38 @@ pub async fn forward_upstream(
         }
 
         let start = std::time::Instant::now();
-        let (res, proto): (anyhow::Result<Bytes>, &str) = match transport_for_addr {
+        // `via` is the transport that actually carried the answer (UDP may fall
+        // back to TCP) / `via` 为实际带回答案的传输（UDP 可能回退到 TCP）
+        let (res, proto, via): (anyhow::Result<Bytes>, &str, Transport) = match transport_for_addr {
             Transport::Udp => {
-                let r = forward_udp_smart(engine, packet, addr, timeout_dur, true).await;
-                (r, "udp")
+                match forward_udp_smart_via(engine, packet, addr, timeout_dur, true).await {
+                    Ok((bytes, via)) => (Ok(bytes), "udp", via),
+                    Err(err) => (Err(err), "udp", Transport::Udp),
+                }
             }
             Transport::Tcp => {
                 let r = engine.tcp_mux.send(packet, addr, timeout_dur).await;
-                (r, "tcp")
+                (r, "tcp", Transport::Tcp)
             }
             Transport::TcpUdp => {
                 // Dual-send: spawn both TCP and UDP concurrently, use first response
                 // 双发：同时发送 TCP 和 UDP，使用第一个响应
                 forward_tcp_udp_dual(engine, packet, addr, timeout_dur)
                     .await
-                    .map(|(bytes, proto)| (Ok(bytes), proto))
-                    .unwrap_or_else(|e| (Err(e), "udp"))
+                    .map(|(bytes, proto)| (Ok(bytes), proto, label_transport(proto)))
+                    .unwrap_or_else(|e| (Err(e), "udp", Transport::TcpUdp))
             }
             Transport::Doh => {
                 let r = engine.doh_client.send(packet, addr, timeout_dur).await;
-                (r, "doh")
+                (r, "doh", Transport::Doh)
             }
             Transport::Dot => {
                 let r = engine.dot_mux.send(packet, addr, timeout_dur).await;
-                (r, "dot")
+                (r, "dot", Transport::Dot)
             }
             Transport::Doq => {
                 let r = engine.doq_client.send(packet, addr, timeout_dur).await;
-                (r, "doq")
+                (r, "doq", Transport::Doq)
             }
         };
         let dur = start.elapsed();
@@ -333,6 +337,7 @@ pub async fn forward_upstream(
                         &UpstreamResult {
                             upstream: addr,
                             transport: transport_for_addr,
+                            via,
                             outcome: UpstreamOutcome::Success,
                             latency: dur,
                             rcode: quick.as_ref().map(|qr| qr.rcode),
@@ -365,6 +370,7 @@ pub async fn forward_upstream(
                         &UpstreamResult {
                             upstream: addr,
                             transport: transport_for_addr,
+                            via: transport_for_addr,
                             outcome: UpstreamOutcome::Error,
                             latency: dur,
                             rcode: None,
@@ -427,28 +433,31 @@ pub async fn forward_upstream(
 
         tasks.spawn(async move {
             let start = std::time::Instant::now();
-            let (proto, res) = match transport_for_task {
+            let (proto, res, via) = match transport_for_task {
                 Transport::Udp => {
-                    let r = forward_udp_smart(
+                    match forward_udp_smart_via(
                         &engine,
                         &packet,
                         &addr_owned,
                         timeout_dur,
                         !has_tcp_task,
                     )
-                    .await;
-                    ("udp", r)
+                    .await
+                    {
+                        Ok((bytes, via)) => ("udp", Ok(bytes), via),
+                        Err(err) => ("udp", Err(err), Transport::Udp),
+                    }
                 }
                 Transport::Tcp => {
                     let r = engine.tcp_mux.send(&packet, &addr_owned, timeout_dur).await;
-                    ("tcp", r)
+                    ("tcp", r, Transport::Tcp)
                 }
                 Transport::TcpUdp => {
                     // Dual-send: spawn both TCP and UDP concurrently, use first response
                     // 双发：同时发送 TCP 和 UDP，使用第一个响应
                     match forward_tcp_udp_dual(&engine, &packet, &addr_owned, timeout_dur).await {
-                        Ok((bytes, proto)) => (proto, Ok(bytes)),
-                        Err(e) => ("udp", Err(e)),
+                        Ok((bytes, proto)) => (proto, Ok(bytes), label_transport(proto)),
+                        Err(e) => ("udp", Err(e), Transport::TcpUdp),
                     }
                 }
                 Transport::Doh => {
@@ -456,18 +465,18 @@ pub async fn forward_upstream(
                         .doh_client
                         .send(&packet, &addr_owned, timeout_dur)
                         .await;
-                    ("doh", r)
+                    ("doh", r, Transport::Doh)
                 }
                 Transport::Dot => {
                     let r = engine.dot_mux.send(&packet, &addr_owned, timeout_dur).await;
-                    ("dot", r)
+                    ("dot", r, Transport::Dot)
                 }
                 Transport::Doq => {
                     let r = engine
                         .doq_client
                         .send(&packet, &addr_owned, timeout_dur)
                         .await;
-                    ("doq", r)
+                    ("doq", r, Transport::Doq)
                 }
             };
 
@@ -479,6 +488,7 @@ pub async fn forward_upstream(
                 upstream_with_proto,
                 addr_owned,
                 transport_for_task,
+                via,
                 res,
                 dur,
             )
@@ -488,7 +498,7 @@ pub async fn forward_upstream(
     // 等待第一个成功响应 / Wait for first successful response
     while let Some(result) = tasks.join_next().await {
         match result {
-            Ok((up_proto, addr, transport_for_task, res, dur)) => {
+            Ok((up_proto, addr, transport_for_task, via, res, dur)) => {
                 if let Some(pending) = pending.as_mut()
                     && let Some(idx) = pending
                         .iter()
@@ -507,6 +517,7 @@ pub async fn forward_upstream(
                             &UpstreamResult {
                                 upstream: &addr,
                                 transport: transport_for_task,
+                                via,
                                 outcome,
                                 latency: dur,
                                 rcode,
@@ -590,6 +601,7 @@ fn report_aborted(observed: Observed<'_>, pending: &[(String, Transport, std::ti
                 &UpstreamResult {
                     upstream,
                     transport: *transport,
+                    via: *transport,
                     outcome: UpstreamOutcome::Aborted,
                     latency: started.elapsed(),
                     rcode: None,
@@ -601,6 +613,15 @@ fn report_aborted(observed: Observed<'_>, pending: &[(String, Transport, std::ti
     }
 }
 
+/// Transport named by a `tcp_udp` race label / `tcp_udp` 竞争标签对应的传输
+fn label_transport(label: &str) -> Transport {
+    if label == "tcp" {
+        Transport::Tcp
+    } else {
+        Transport::Udp
+    }
+}
+
 /// UDP forwarder with hedged retry and TCP fallback for better tail latency.
 async fn forward_udp_smart(
     engine: &Engine,
@@ -609,6 +630,21 @@ async fn forward_udp_smart(
     timeout_dur: Duration,
     allow_tcp_fallback: bool,
 ) -> anyhow::Result<Bytes> {
+    forward_udp_smart_via(engine, packet, upstream, timeout_dur, allow_tcp_fallback)
+        .await
+        .map(|(bytes, _)| bytes)
+}
+
+/// [`forward_udp_smart`] that also returns the transport that carried the
+/// answer: UDP, or TCP after a TC-bit retry or a UDP-failure fallback.
+/// 同 [`forward_udp_smart`]，并返回实际带回答案的传输（UDP，或 TC/失败回退后的 TCP）。
+async fn forward_udp_smart_via(
+    engine: &Engine,
+    packet: &[u8],
+    upstream: &str,
+    timeout_dur: Duration,
+    allow_tcp_fallback: bool,
+) -> anyhow::Result<(Bytes, Transport)> {
     // 获取 TCP fallback 配置（Copy bool 值，避免持有 Guard 跨 await）
     // Get TCP fallback config (Copy bool value to avoid holding Guard across await)
     let enable_tcp_fallback =
@@ -630,9 +666,13 @@ async fn forward_udp_smart(
                     && enable_tcp_fallback
                 {
                     debug!(event = "tc_flag_fallback", upstream = %upstream, "udp response truncated, retrying with tcp");
-                    return engine.tcp_mux.send(packet, upstream, timeout_dur).await;
+                    return engine
+                        .tcp_mux
+                        .send(packet, upstream, timeout_dur)
+                        .await
+                        .map(|bytes| (bytes, Transport::Tcp));
                 }
-                return Ok(bytes);
+                return Ok((bytes, Transport::Udp));
             }
             Err(err) => {
                 debug!(
@@ -646,7 +686,11 @@ async fn forward_udp_smart(
                 if idx + 1 == attempts.len() && enable_tcp_fallback {
                     // Last UDP attempt, try TCP fallback before failing.
                     debug!(event = "udp_forward_fallback_tcp", upstream = %upstream, "falling back to tcp");
-                    return engine.tcp_mux.send(packet, upstream, timeout_dur).await;
+                    return engine
+                        .tcp_mux
+                        .send(packet, upstream, timeout_dur)
+                        .await
+                        .map(|bytes| (bytes, Transport::Tcp));
                 }
             }
         }

@@ -343,8 +343,16 @@ pub struct UpstreamAttempt<'a> {
 pub struct UpstreamResult<'a> {
     /// Upstream address without the transport prefix.
     pub upstream: &'a str,
-    /// Transport selected for this address.
+    /// Transport selected for this address (from its prefix or the configured
+    /// default). One attempt/result pair covers every send made for the
+    /// address: a UDP attempt may consist of a hedged retry plus a TCP
+    /// fallback, up to three real sends.
     pub transport: Transport,
+    /// Transport that actually carried the answer. Differs from `transport`
+    /// when a UDP query fell back to TCP (TC bit set, or UDP failed with TCP
+    /// fallback enabled) and for `tcp_udp`, where it names the side that won.
+    /// Equals `transport` for errors and aborted attempts.
+    pub via: Transport,
     /// Result classification.
     pub outcome: UpstreamOutcome,
     /// Time spent on this attempt.
@@ -561,6 +569,7 @@ impl EngineObserver for TracingObserver {
             upstream = event.upstream,
             transport = ?event.transport,
             outcome = ?event.outcome,
+            via = ?event.via,
             latency_us = event.latency.as_micros() as u64,
             rcode = event.rcode.map(tracing::field::display),
             truncated = event.truncated,
@@ -672,6 +681,7 @@ mod tests {
                 &UpstreamResult {
                     upstream: "1.1.1.1:53",
                     transport: Transport::Udp,
+                    via: Transport::Udp,
                     outcome: UpstreamOutcome::Error,
                     latency: Duration::from_millis(3),
                     rcode: None,

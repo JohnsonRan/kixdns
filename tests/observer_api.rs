@@ -135,6 +135,8 @@ enum Event {
     UpstreamResult {
         id: u64,
         upstream: String,
+        transport: Transport,
+        via: Transport,
         outcome: UpstreamOutcome,
         rcode: Option<ResponseCode>,
         truncated: Option<bool>,
@@ -279,6 +281,8 @@ impl EngineObserver for Recorder {
         self.push(Event::UpstreamResult {
             id: ctx.request_id,
             upstream: event.upstream.to_string(),
+            transport: event.transport,
+            via: event.via,
             outcome: event.outcome,
             rcode: event.rcode,
             truncated: event.truncated,
@@ -913,6 +917,8 @@ async fn upstream_success_then_fresh_and_stale_cache_hits() {
             Event::UpstreamResult {
                 id,
                 upstream: upstream.clone(),
+                transport: Transport::Udp,
+                via: Transport::Udp,
                 outcome: UpstreamOutcome::Success,
                 rcode: Some(ResponseCode::NoError),
                 truncated: Some(false),
@@ -1233,6 +1239,98 @@ async fn decision_made_reports_no_transport_for_prefixed_upstreams() {
     );
 }
 
+/// DNS-over-TCP responder that answers every query with one A record.
+/// 对每个查询以一条 A 记录应答的 DNS-over-TCP 服务。
+async fn spawn_tcp_dns_server(listener: tokio::net::TcpListener) -> tokio::task::JoinHandle<()> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    tokio::spawn(async move {
+        while let Ok((mut stream, _)) = listener.accept().await {
+            tokio::spawn(async move {
+                let mut len = [0u8; 2];
+                if stream.read_exact(&mut len).await.is_err() {
+                    return;
+                }
+                let mut frame = vec![0u8; u16::from_be_bytes(len) as usize];
+                if stream.read_exact(&mut frame).await.is_err() {
+                    return;
+                }
+                let Ok(request) = Message::from_bytes(&frame) else {
+                    return;
+                };
+                let Some(question) = request.queries.first().cloned() else {
+                    return;
+                };
+                let mut response =
+                    Message::new(request.metadata.id, MessageType::Response, OpCode::Query);
+                response.add_query(question.clone());
+                response.add_answer(Record::from_rdata(
+                    question.name().clone(),
+                    60,
+                    RData::A(A(std::net::Ipv4Addr::LOCALHOST)),
+                ));
+                let bytes = response.to_vec().unwrap();
+                let mut out = (bytes.len() as u16).to_be_bytes().to_vec();
+                out.extend_from_slice(&bytes);
+                let _ = stream.write_all(&out).await;
+            });
+        }
+    })
+}
+
+#[tokio::test]
+async fn tcp_fallback_reports_the_transport_that_answered() {
+    // UDP never answers; a DNS-over-TCP responder listens on the same port
+    // UDP 只收不回；同一端口上有 DNS-over-TCP 应答者
+    let silent_udp = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let port = silent_udp.local_addr().unwrap().port();
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", port))
+        .await
+        .unwrap();
+    let _tcp = spawn_tcp_dns_server(listener).await;
+    let upstream = format!("127.0.0.1:{port}");
+    let raw = serde_json::json!({
+        "settings": { "default_upstream": "127.0.0.1:9", "upstream_timeout_ms": 300 },
+        "pipelines": [{
+            "id": "main",
+            "rules": [{
+                "name": "fwd",
+                "matchers": [{ "type": "any" }],
+                "actions": [{ "type": "forward", "upstream": upstream, "transport": "udp" }]
+            }]
+        }]
+    })
+    .to_string();
+    let (engine, recorder) = observed_engine(&raw);
+
+    let response = engine
+        .handle_packet(&query("fallback.example"), peer())
+        .await
+        .unwrap();
+    assert_eq!(rcode_of(&response), ResponseCode::NoError);
+    let events = recorder.drain();
+    let id = request_id_for(&events, "fallback.example");
+    let mine = events_of(&events, id);
+    assert!(mine.contains(&Event::UpstreamAttempt {
+        id,
+        upstream: upstream.clone(),
+        transport: Transport::Udp,
+    }));
+    assert!(
+        mine.contains(&Event::UpstreamResult {
+            id,
+            upstream: upstream.clone(),
+            transport: Transport::Udp,
+            via: Transport::Tcp,
+            outcome: UpstreamOutcome::Success,
+            rcode: Some(ResponseCode::NoError),
+            truncated: Some(false),
+            has_error: false,
+        }),
+        "{mine:#?}"
+    );
+    drop(silent_udp);
+}
+
 #[tokio::test]
 async fn failed_upstream_is_reported_with_error() {
     let raw = serde_json::json!({
@@ -1270,6 +1368,8 @@ async fn failed_upstream_is_reported_with_error() {
         mine.contains(&Event::UpstreamResult {
             id,
             upstream: "127.0.0.1:9".into(),
+            transport: Transport::Udp,
+            via: Transport::Udp,
             outcome: UpstreamOutcome::Error,
             rcode: None,
             truncated: None,
