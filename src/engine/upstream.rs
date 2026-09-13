@@ -39,6 +39,13 @@ impl std::error::Error for UpstreamFailure {
     }
 }
 
+/// Whether an upstream address carries a `scheme://` transport prefix, which
+/// [`parse_upstream_addr`] lets override the configured transport.
+/// 上游地址是否带 `scheme://` 传输前缀（parse_upstream_addr 以前缀覆盖配置的传输）。
+pub(crate) fn has_transport_prefix(addr: &str) -> bool {
+    addr.contains("://")
+}
+
 /// Parse upstream address with optional protocol prefix.
 /// 解析带有可选协议前缀的 upstream 地址。
 ///

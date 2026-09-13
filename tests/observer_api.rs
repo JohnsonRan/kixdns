@@ -1136,6 +1136,104 @@ async fn concurrent_upstreams_report_the_loser_as_aborted() {
 }
 
 #[tokio::test]
+async fn decision_made_reports_no_transport_for_prefixed_upstreams() {
+    let forward_of = |events: &[Event], id: u64| -> (Option<Transport>, Transport) {
+        let mine = events_of(events, id);
+        let decided = mine
+            .iter()
+            .find_map(|event| match event {
+                Event::Decision {
+                    detail: Detail::Forward { transport, .. },
+                    ..
+                } => Some(*transport),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("no forward decision: {mine:#?}"));
+        let attempted = mine
+            .iter()
+            .find_map(|event| match event {
+                Event::UpstreamAttempt { transport, .. } => Some(*transport),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("no upstream attempt: {mine:#?}"));
+        (decided, attempted)
+    };
+
+    // Default upstream with a dot:// prefix and no pipeline at all
+    // 带 dot:// 前缀的默认上游，且没有任何 pipeline
+    let raw = serde_json::json!({
+        "settings": {
+            "default_upstream": "dot://127.0.0.1:9",
+            "upstream_timeout_ms": 300,
+            "enable_tcp_fallback": false
+        },
+        "pipelines": []
+    })
+    .to_string();
+    let (engine, recorder) = observed_engine(&raw);
+    let _ = engine.handle_packet(&query("dot.example"), peer()).await;
+    let events = recorder.drain();
+    let id = request_id_for(&events, "dot.example");
+    assert_eq!(forward_of(&events, id), (None, Transport::Dot));
+    assert!(events_of(&events, id).iter().any(|event| matches!(
+        event,
+        Event::Decision { rule: None, detail: Detail::Forward { upstream, .. }, .. }
+            if upstream == "dot://127.0.0.1:9"
+    )));
+
+    // forward action with a tcp:// prefix and no transport field
+    // 带 tcp:// 前缀且省略 transport 字段的 forward 动作
+    let raw = serde_json::json!({
+        "settings": {
+            "default_upstream": "127.0.0.1:9",
+            "upstream_timeout_ms": 300,
+            "enable_tcp_fallback": false
+        },
+        "pipelines": [{
+            "id": "main",
+            "rules": [{
+                "name": "fwd",
+                "matchers": [{ "type": "any" }],
+                "actions": [{ "type": "forward", "upstream": "tcp://127.0.0.1:9" }]
+            }]
+        }]
+    })
+    .to_string();
+    let (engine, recorder) = observed_engine(&raw);
+    let _ = engine.handle_packet(&query("tcp.example"), peer()).await;
+    let events = recorder.drain();
+    let id = request_id_for(&events, "tcp.example");
+    assert_eq!(forward_of(&events, id), (None, Transport::Tcp));
+
+    // Control: a bare address keeps the configured (default UDP) transport
+    // 对照：裸地址保留配置的传输（默认 UDP）
+    let raw = serde_json::json!({
+        "settings": {
+            "default_upstream": "127.0.0.1:9",
+            "upstream_timeout_ms": 300,
+            "enable_tcp_fallback": false
+        },
+        "pipelines": [{
+            "id": "main",
+            "rules": [{
+                "name": "fwd",
+                "matchers": [{ "type": "any" }],
+                "actions": [{ "type": "forward", "upstream": "127.0.0.1:9" }]
+            }]
+        }]
+    })
+    .to_string();
+    let (engine, recorder) = observed_engine(&raw);
+    let _ = engine.handle_packet(&query("udp.example"), peer()).await;
+    let events = recorder.drain();
+    let id = request_id_for(&events, "udp.example");
+    assert_eq!(
+        forward_of(&events, id),
+        (Some(Transport::Udp), Transport::Udp)
+    );
+}
+
+#[tokio::test]
 async fn failed_upstream_is_reported_with_error() {
     let raw = serde_json::json!({
         "settings": {

@@ -6,8 +6,9 @@
 use std::sync::Arc;
 use std::time::Instant;
 
-use crate::config::Action;
+use crate::config::{Action, Transport};
 use crate::engine::rules::Decision;
+use crate::engine::upstream::has_transport_prefix;
 use crate::observe::{
     DecisionDetail, DecisionKind, DecisionMade, EngineObserver, RequestContext, RequestOutcome,
     RequestStatus, RuleMatched, RulePhase,
@@ -80,9 +81,28 @@ pub(crate) fn decision_detail(decision: &Decision) -> DecisionDetail<'_> {
             ..
         } => DecisionDetail::Forward {
             upstream,
-            transport: *transport,
+            transport: reported_transport(upstream, *transport),
         },
         Decision::Jump { pipeline } => DecisionDetail::Jump { pipeline },
+    }
+}
+
+/// Transport to attribute to a forward decision: `None` when any listed
+/// address carries its own `scheme://` prefix (the prefix wins when the
+/// query is sent), otherwise the configured transport, UDP by default. This
+/// mirrors what `forward_upstream` will actually select.
+/// 转发决策应报告的传输：任一地址带前缀时为 None（发送时前缀优先），否则为配置的传输，默认 UDP。
+pub(crate) fn reported_transport(
+    upstream: &str,
+    transport: Option<Transport>,
+) -> Option<Transport> {
+    if upstream
+        .split(',')
+        .any(|addr| has_transport_prefix(addr.trim()))
+    {
+        None
+    } else {
+        Some(transport.unwrap_or(Transport::Udp))
     }
 }
 
