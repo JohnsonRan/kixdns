@@ -1,6 +1,7 @@
 use super::Engine;
 use crate::cache::CacheEntry;
 use crate::config::{Action, Transport};
+use crate::engine::observation::{Observed, response_decision_kind};
 use crate::engine::response::{extract_ttl, extract_ttl_for_refresh};
 use crate::engine::rules::{self, ResponseActionResult, ResponseContext};
 use crate::engine::types::EngineInner;
@@ -8,6 +9,7 @@ use crate::engine::upstream::UpstreamFailure;
 use crate::engine::utils::InflightCleanupGuard;
 use crate::engine::utils::engine_helpers::{build_response, build_servfail_response_fast};
 use crate::matcher::{RuntimeResponseMatcherWithOp, eval_match_chain};
+use crate::observe::{CacheHit, CacheHitKind, RuleEvaluated, RuleMatched, RulePhase};
 use crate::proto_utils;
 use anyhow::Context;
 use bytes::{Bytes, BytesMut};
@@ -40,6 +42,9 @@ pub struct CacheLookupContext<'a> {
     pub tx_id: u16,
     pub start: Instant,
     pub peer: &'a std::net::SocketAddr,
+    /// Observer context of the request; cache hits are reported through it.
+    /// 所属请求的观察者上下文；缓存命中通过它上报。
+    pub observed: Observed<'a>,
 }
 
 pub fn check_cache(engine: &Engine, context: &CacheLookupContext<'_>) -> Option<Bytes> {
@@ -53,6 +58,7 @@ pub fn check_cache(engine: &Engine, context: &CacheLookupContext<'_>) -> Option<
         tx_id,
         start,
         peer,
+        observed,
     } = *context;
 
     // moka 同步缓存自动处理过期，无需检查 expires_at / moka sync cache automatically handles expiration, no need to check expires_at
@@ -167,6 +173,16 @@ pub fn check_cache(engine: &Engine, context: &CacheLookupContext<'_>) -> Option<
                     "RFC 8767: serving stale cache entry on TTL expiry"
                 );
 
+                if let Some((observer, ctx)) = observed {
+                    observer.cache_hit(
+                        ctx,
+                        &CacheHit {
+                            kind: CacheHitKind::Stale,
+                            remaining_ttl: None,
+                            original_ttl: Some(Duration::from_secs(hit.original_ttl as u64)),
+                        },
+                    );
+                }
                 return Some(resp_bytes.freeze());
             } else {
                 // Cache hit is valid
@@ -247,6 +263,18 @@ pub fn check_cache(engine: &Engine, context: &CacheLookupContext<'_>) -> Option<
                     "cache hit"
                 );
 
+                if let Some((observer, ctx)) = observed {
+                    observer.cache_hit(
+                        ctx,
+                        &CacheHit {
+                            kind: CacheHitKind::Fresh,
+                            remaining_ttl: Some(Duration::from_secs(
+                                hit.original_ttl.saturating_sub(elapsed) as u64,
+                            )),
+                            original_ttl: Some(Duration::from_secs(hit.original_ttl as u64)),
+                        },
+                    );
+                }
                 return Some(resp_bytes);
             }
         }
@@ -258,7 +286,14 @@ pub fn check_cache(engine: &Engine, context: &CacheLookupContext<'_>) -> Option<
 /// Returns the stale response bytes with TTL set to serve_stale_ttl.
 /// RFC 8767: 检查是否存在过期但仍在 moka 中的缓存条目。
 /// 返回 TTL 设置为 serve_stale_ttl 的过期响应字节。
-pub fn check_stale_cache(engine: &Engine, context: &CacheLookupContext<'_>) -> Option<Bytes> {
+///
+/// `kind` names the stale-serving path for the observer (client timeout or
+/// upstream failure). / `kind` 标明过期服务的路径（客户端超时或上游失败），用于上报观察者。
+pub fn check_stale_cache(
+    engine: &Engine,
+    context: &CacheLookupContext<'_>,
+    kind: CacheHitKind,
+) -> Option<Bytes> {
     let CacheLookupContext {
         state,
         qname: qname_ref,
@@ -269,6 +304,7 @@ pub fn check_stale_cache(engine: &Engine, context: &CacheLookupContext<'_>) -> O
         tx_id,
         start: _,
         peer,
+        observed,
     } = *context;
     if !engine.serve_stale {
         return None;
@@ -346,6 +382,16 @@ pub fn check_stale_cache(engine: &Engine, context: &CacheLookupContext<'_>) -> O
                 );
             }
 
+            if let Some((observer, ctx)) = observed {
+                observer.cache_hit(
+                    ctx,
+                    &CacheHit {
+                        kind,
+                        remaining_ttl: None,
+                        original_ttl: Some(Duration::from_secs(hit.original_ttl as u64)),
+                    },
+                );
+            }
             return Some(resp_bytes.freeze());
         }
     }
@@ -450,6 +496,8 @@ pub struct ForwardDecisionContext<'a> {
     pub ecs: Option<&'a crate::config::EcsMode>,
     pub allow_reuse: bool,
     pub reused_response: &'a mut Option<ResponseContext>,
+    /// Observer context of the request / 所属请求的观察者上下文
+    pub observed: Observed<'a>,
 }
 
 pub async fn handle_forward_decision(
@@ -480,6 +528,7 @@ pub async fn handle_forward_decision(
         ecs,
         allow_reuse,
         reused_response,
+        observed,
     } = context;
 
     // ECS request rewriting (RFC 7871): modify outgoing packet before forwarding.
@@ -551,6 +600,7 @@ pub async fn handle_forward_decision(
                 upstream_timeout,
                 transport,
                 pre_split_upstreams,
+                observed,
             )
             .await
         }
@@ -599,6 +649,7 @@ pub async fn handle_forward_decision(
             upstream_timeout,
             transport,
             pre_split_upstreams,
+            observed,
         )
         .await
     };
@@ -656,6 +707,7 @@ pub async fn handle_forward_decision(
                     upstream_timeout,
                     Some(Transport::Tcp),
                     pre_split_upstreams,
+                    observed,
                 )
                 .await?;
                 if let Some(guard) = cleanup_guard.as_mut() {
@@ -716,6 +768,34 @@ pub async fn handle_forward_decision(
                     )
                 }
             };
+
+            if !skip_cache
+                && !response_matchers.is_empty()
+                && let Some((observer, ctx)) = observed
+            {
+                observer.rule_evaluated(
+                    ctx,
+                    &RuleEvaluated {
+                        pipeline: pipeline_id,
+                        rule: rule_name,
+                        phase: RulePhase::Response,
+                        matched: resp_match_ok,
+                        matchers: response_matchers.len(),
+                    },
+                );
+                if resp_match_ok {
+                    observer.rule_matched(
+                        ctx,
+                        &RuleMatched {
+                            pipeline: pipeline_id,
+                            rule: rule_name,
+                            phase: RulePhase::Response,
+                            decision: response_decision_kind(response_actions_on_match),
+                            fast_path: false,
+                        },
+                    );
+                }
+            }
 
             let empty_actions = Vec::new();
             let actions_to_run = if skip_cache {
@@ -809,7 +889,7 @@ pub async fn handle_forward_decision(
                 remaining_jumps: response_jump_limit,
             };
 
-            let action_result = rules::apply_response_actions(ctx).await?;
+            let action_result = rules::apply_response_actions_observed(ctx, observed).await?;
 
             match action_result {
                 ResponseActionResult::Upstream { ctx, resp_match: _ } => {
@@ -884,6 +964,7 @@ pub async fn handle_forward_decision(
                             min_ttl,
                             upstream_timeout,
                             skip_cache,
+                            observed,
                         },
                     )
                     .await?;
@@ -946,7 +1027,11 @@ pub async fn handle_forward_decision(
                         tx_id,
                         start,
                         peer,
+                        // A background refresh never looked the cache up, so it
+                        // must not report a hit either / 后台刷新没有查过缓存，也不能上报命中
+                        observed: if skip_cache { None } else { observed },
                     },
+                    CacheHitKind::StaleUpstreamFailure,
                 ) {
                     warn!(
                         event = "serve_stale_on_upstream_failure",
@@ -1033,7 +1118,7 @@ pub async fn handle_forward_decision(
                     rule_name,
                     remaining_jumps: response_jump_limit,
                 };
-                let action_result = rules::apply_response_actions(ctx).await?;
+                let action_result = rules::apply_response_actions_observed(ctx, observed).await?;
 
                 match action_result {
                     ResponseActionResult::Upstream { ctx, resp_match: _ } => {
@@ -1118,6 +1203,7 @@ pub async fn handle_forward_decision(
                                 min_ttl,
                                 upstream_timeout,
                                 skip_cache,
+                                observed,
                             },
                         )
                         .await?;

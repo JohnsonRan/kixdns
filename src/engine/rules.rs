@@ -27,6 +27,9 @@ use crate::engine::utils::engine_helpers::{self, build_response};
 use crate::engine::utils::parse_rcode;
 use crate::matcher::RuntimeResponseMatcherWithOp;
 use crate::matcher::eval_match_chain;
+use crate::observe::{RuleEvaluated, RuleMatched, RulePhase};
+
+use super::observation::{Observed, response_decision_kind};
 
 #[derive(Debug, Clone)]
 pub enum Decision {
@@ -118,6 +121,22 @@ pub struct RuleCacheEntry {
     pub decision: Arc<Decision>,
     /// Expiration time based on DNS TTL / 基于 DNS TTL 的过期时间
     pub expires_at: Option<Instant>,
+}
+
+/// Rule cache value: the cached decision plus the request-phase rules whose
+/// matchers matched while producing it (in evaluation order, the last one
+/// being the deciding rule). Rule cache hits replay them to observers.
+/// 规则缓存值：缓存的决策以及产生它时命中的请求阶段规则（按求值顺序，最后
+/// 一条为决定性规则）。规则缓存命中时向观察者回放。
+#[derive(Clone)]
+pub struct RuleCacheRecord {
+    pub entry: RuleCacheEntry,
+    /// Recorded only when an observer is installed; `None` otherwise, so the
+    /// rule cache costs nothing extra without one. / 仅在安装了观察者时记录，否则为 None。
+    pub matched_rules: Option<Arc<[Arc<str>]>>,
+    /// `false` when no rule decided and the default upstream applied.
+    /// 无规则决定、使用默认上游时为 false。
+    pub decided_by_rule: bool,
 }
 
 impl RuleCacheEntry {
@@ -250,8 +269,20 @@ pub struct ApplyResponseActionsContext<'a> {
     pub remaining_jumps: usize,
 }
 
+/// Test-only shorthand for [`apply_response_actions_observed`] without an observer context.
+#[cfg(test)]
 pub(crate) async fn apply_response_actions(
+    ctx: ApplyResponseActionsContext<'_>,
+) -> anyhow::Result<ResponseActionResult> {
+    apply_response_actions_observed(ctx, None).await
+}
+
+/// [`apply_response_actions`] with the observer context of the request, so
+/// upstream attempts made by response-phase `forward` actions are reported.
+/// 带观察者上下文的 [`apply_response_actions`]，使响应阶段 forward 动作的上游尝试得以上报。
+pub(crate) async fn apply_response_actions_observed(
     mut ctx: ApplyResponseActionsContext<'_>,
+    observed: Observed<'_>,
 ) -> anyhow::Result<ResponseActionResult> {
     const MAX_RESPONSE_FORWARDS: usize = 4;
     let mut forward_attempts = 0usize;
@@ -433,6 +464,7 @@ pub(crate) async fn apply_response_actions(
                     ctx.upstream_timeout,
                     Some(use_transport),
                     pre_split_upstreams.as_ref(),
+                    observed,
                 )
                 .await
                 {
@@ -521,6 +553,8 @@ pub(crate) struct ResponseJumpContext<'a> {
     pub min_ttl: Duration,
     pub upstream_timeout: Duration,
     pub skip_cache: bool,
+    /// Observer context of the request / 所属请求的观察者上下文
+    pub observed: Observed<'a>,
 }
 
 pub(crate) async fn process_response_jump(
@@ -541,6 +575,7 @@ pub(crate) async fn process_response_jump(
         min_ttl,
         upstream_timeout,
         skip_cache,
+        observed,
     } = context;
     let cfg = &state.pipeline;
     struct InflightCleanupGuard {
@@ -602,6 +637,9 @@ pub(crate) async fn process_response_jump(
             }
             return Ok(resp_bytes);
         };
+        if let Some((observer, ctx)) = observed {
+            observer.pipeline_selected(ctx, &pipeline.id);
+        }
 
         let mut ecs_key = pipeline
             .ecs
@@ -623,7 +661,8 @@ pub(crate) async fn process_response_jump(
                     Some(&skip_rules)
                 },
                 skip_cache,
-            ),
+            )
+            .with_observed(observed),
         );
 
         // Resolve nested rule-level jumps first
@@ -647,6 +686,9 @@ pub(crate) async fn process_response_jump(
                     .get(pipeline_id.as_ref())
                     .and_then(|&idx| cfg.pipelines.get(idx))
                 {
+                    if let Some((observer, ctx)) = observed {
+                        observer.pipeline_selected(ctx, &next_pipeline.id);
+                    }
                     ecs_key = next_pipeline
                         .ecs
                         .as_ref()
@@ -663,7 +705,8 @@ pub(crate) async fn process_response_jump(
                             edns_present,
                             None,
                             skip_cache,
-                        ),
+                        )
+                        .with_observed(observed),
                     );
                     continue;
                 } else {
@@ -801,6 +844,7 @@ pub(crate) async fn process_response_jump(
                             upstream_timeout,
                             transport,
                             pre_split_upstreams.as_ref(),
+                            observed,
                         )
                         .await
                     }
@@ -878,6 +922,7 @@ pub(crate) async fn process_response_jump(
                         upstream_timeout,
                         transport,
                         pre_split_upstreams.as_ref(),
+                        observed,
                     )
                     .await
                 };
@@ -933,6 +978,35 @@ pub(crate) async fn process_response_jump(
                                 },
                             )
                         }; // guards are dropped here / 锁在此处释放
+
+                        if !response_matchers.is_empty()
+                            && let Some((observer, ctx)) = observed
+                        {
+                            observer.rule_evaluated(
+                                ctx,
+                                &RuleEvaluated {
+                                    pipeline: &pipeline_id,
+                                    rule: &rule_name,
+                                    phase: RulePhase::Response,
+                                    matched: resp_match_ok,
+                                    matchers: response_matchers.len(),
+                                },
+                            );
+                            if resp_match_ok {
+                                observer.rule_matched(
+                                    ctx,
+                                    &RuleMatched {
+                                        pipeline: &pipeline_id,
+                                        rule: &rule_name,
+                                        phase: RulePhase::Response,
+                                        decision: response_decision_kind(
+                                            &response_actions_on_match,
+                                        ),
+                                        fast_path: false,
+                                    },
+                                );
+                            }
+                        }
 
                         let actions_to_run = if !response_actions_on_match.is_empty()
                             || !response_actions_on_miss.is_empty()
@@ -997,7 +1071,8 @@ pub(crate) async fn process_response_jump(
                             rule_name: &rule_name,
                             remaining_jumps,
                         };
-                        let action_result = apply_response_actions(apply_ctx).await?;
+                        let action_result =
+                            apply_response_actions_observed(apply_ctx, observed).await?;
 
                         match action_result {
                             ResponseActionResult::Upstream { ctx, resp_match } => {

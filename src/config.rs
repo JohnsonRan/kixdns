@@ -1,4 +1,5 @@
 use std::fs;
+use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -6,6 +7,8 @@ use anyhow::Context;
 use anyhow::Result;
 use ipnet::IpNet;
 use serde::Deserialize;
+
+use crate::matcher::RuntimePipelineConfig;
 use tracing::info;
 
 #[derive(Debug, Clone, Deserialize)]
@@ -737,7 +740,64 @@ impl Rule {
     }
 }
 
+/// Listener endpoints resolved from [`GlobalSettings`], exactly as the server
+/// binds them. / 从 [`GlobalSettings`] 解析出的监听端点，与服务器实际绑定的一致。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ListenerConfig {
+    /// UDP listener address (`bind_udp`).
+    pub udp: SocketAddr,
+    /// TCP listener address (`bind_tcp`).
+    pub tcp: SocketAddr,
+    /// DoH listener, present when `bind_doh` is set.
+    pub doh: Option<DohListenerConfig>,
+}
+
+/// Inbound DoH listener settings with the TLS material it requires.
+/// 入站 DoH 监听设置及其所需的 TLS 材料。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DohListenerConfig {
+    /// DoH listener address (`bind_doh`).
+    pub bind: SocketAddr,
+    /// PEM certificate path (`doh_tls_cert`).
+    pub tls_cert: String,
+    /// PEM private key path (`doh_tls_key`).
+    pub tls_key: String,
+    /// HTTP path served (`doh_path`).
+    pub path: String,
+}
+
 impl GlobalSettings {
+    /// Parse the listener addresses and check the DoH prerequisites the way
+    /// server startup does; a configuration that fails here cannot be served.
+    /// Both the server and [`validate`] call this.
+    /// 按服务器启动的方式解析监听地址并检查 DoH 前置条件；此处失败的配置无法启动。
+    /// 服务器与 [`validate`] 都调用它。
+    pub fn listeners(&self) -> anyhow::Result<ListenerConfig> {
+        let udp: SocketAddr = self.bind_udp.parse().context("parse bind addr")?;
+        let tcp: SocketAddr = self.bind_tcp.parse().context("parse tcp bind addr")?;
+        let doh = match &self.bind_doh {
+            Some(bind_doh) => {
+                let bind: SocketAddr = bind_doh.parse().context("parse doh bind addr")?;
+                let tls_cert = self
+                    .doh_tls_cert
+                    .clone()
+                    .context("doh_tls_cert is required when bind_doh is set")?;
+                let tls_key = self
+                    .doh_tls_key
+                    .clone()
+                    .context("doh_tls_key is required when bind_doh is set")?;
+                Some(DohListenerConfig {
+                    bind,
+                    tls_cert,
+                    tls_key,
+                    path: self.doh_path.clone(),
+                })
+            }
+            None => None,
+        };
+        Ok(ListenerConfig { udp, tcp, doh })
+    }
+
     /// 预分割默认 upstream 字符串以优化性能（在配置加载时调用）/ Pre-split default upstream string for performance (call during config loading)
     #[inline]
     pub fn pre_split_default_upstream(&mut self) {
@@ -825,14 +885,30 @@ fn default_match_operator() -> MatchOperator {
 }
 
 pub fn load_config(path: &Path) -> Result<PipelineConfig> {
+    load_config_with_source(path).map(|(cfg, _)| cfg)
+}
+
+/// Load the configuration file at `path` and return it together with the
+/// text it was parsed from, so callers can fingerprint the active
+/// configuration. / 加载配置文件并连同原始文本一起返回，便于调用方计算指纹。
+pub fn load_config_with_source(path: &Path) -> Result<(PipelineConfig, String)> {
     let raw = fs::read_to_string(path)
         .with_context(|| format!("read config file: {}", path.display()))?;
-    let mut cfg: PipelineConfig = serde_json::from_str(&raw)
-        .with_context(|| format!("parse config file: {}", path.display()))?;
+    let cfg =
+        parse_config(&raw).with_context(|| format!("parse config file: {}", path.display()))?;
 
     if let Some(version) = cfg.version.as_ref() {
         info!(target = "config", version = %version, "config loaded");
     }
+
+    Ok((cfg, raw))
+}
+
+/// Parse and normalize a configuration from its JSON text without touching
+/// the filesystem. Errors from the JSON layer carry line/column positions.
+/// 从 JSON 文本解析并规范化配置，不访问文件系统。JSON 层错误带行列位置。
+pub fn parse_config(raw: &str) -> Result<PipelineConfig> {
+    let mut cfg: PipelineConfig = serde_json::from_str(raw).context("parse config JSON")?;
 
     // 轻量校验：CIDR提前解析，便于后续快速匹配。 / Lightweight validation: parse CIDR in advance for subsequent fast matching
     // 预分割 upstream 字符串以提高性能 / Pre-split upstream strings for better performance
@@ -1159,6 +1235,37 @@ fn default_ecs_prefix_v6() -> u8 {
     56 // Common ISP allocation boundary
 }
 
+/// Summary of a configuration that passed [`validate`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct ValidationReport {
+    /// The configuration's `version` field, if present.
+    pub version: Option<String>,
+    /// Number of pipelines.
+    pub pipeline_count: usize,
+    /// Total number of rules across all pipelines.
+    pub rule_count: usize,
+}
+
+/// Validate configuration text exactly as the server loads it: JSON parsing,
+/// normalisation, runtime compilation (matchers, regexes, CIDRs, timeout
+/// sanity) and the listener checks done at startup
+/// ([`GlobalSettings::listeners`]: bind addresses and DoH TLS material).
+/// Errors carry their cause chain; JSON syntax errors include the line and
+/// column. / 按服务器加载配置的方式校验文本：JSON 解析、规范化、运行时编译以及
+/// 启动时的监听检查（绑定地址与 DoH TLS 材料）。错误带完整原因链；JSON 语法错误包含行列位置。
+pub fn validate(raw: &str) -> Result<ValidationReport> {
+    let cfg = parse_config(raw)?;
+    let version = cfg.version.clone();
+    let runtime = RuntimePipelineConfig::from_config(cfg).context("compile configuration")?;
+    runtime.settings.listeners().context("validate listeners")?;
+    Ok(ValidationReport {
+        version,
+        pipeline_count: runtime.pipelines.len(),
+        rule_count: runtime.pipelines.iter().map(|p| p.rules.len()).sum(),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::{Matcher, PipelineSelectorMatcher, ResponseMatcher};
@@ -1188,5 +1295,99 @@ mod tests {
             panic!("unexpected response matcher variant");
         };
         assert_eq!(country_codes, ["CN", "cloudflare"]);
+    }
+}
+
+#[cfg(test)]
+mod validation_tests {
+    use super::validate;
+
+    #[test]
+    fn validate_reports_counts_for_a_valid_config() {
+        let raw = r#"{
+            "version": "t1",
+            "settings": { "default_upstream": "1.1.1.1:53" },
+            "pipelines": [
+                {
+                    "id": "main",
+                    "rules": [
+                        { "name": "a", "matchers": [{ "type": "any" }], "actions": [{ "type": "allow" }] },
+                        {
+                            "name": "b",
+                            "matchers": [{ "type": "domain_suffix", "value": "example.com" }],
+                            "actions": [{ "type": "static_response", "rcode": "NXDOMAIN" }]
+                        }
+                    ]
+                },
+                { "id": "other", "rules": [] }
+            ]
+        }"#;
+        let report = validate(raw).expect("valid config");
+        assert_eq!(report.version.as_deref(), Some("t1"));
+        assert_eq!(report.pipeline_count, 2);
+        assert_eq!(report.rule_count, 2);
+    }
+
+    #[test]
+    fn validate_locates_json_syntax_errors() {
+        let err = validate("{\n  \"pipelines\": [\n").expect_err("truncated JSON");
+        let text = format!("{err:#}");
+        assert!(
+            text.contains("line 3"),
+            "error should carry a position: {text}"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_invalid_selector_cidr() {
+        let raw = r#"{
+            "pipeline_select": [{
+                "pipeline": "default",
+                "matchers": [{ "type": "client_ip", "cidr": "invalid" }]
+            }]
+        }"#;
+        assert!(validate(raw).is_err());
+    }
+
+    #[test]
+    fn validate_rejects_configs_the_server_cannot_bind() {
+        // Each row: settings JSON and whether the server would start with it
+        // 每行：settings JSON 以及服务器能否以此启动
+        let cases = [
+            (r#"{ "bind_udp": "not-an-address" }"#, false),
+            (r#"{ "bind_tcp": "999.999.999.999:53" }"#, false),
+            (
+                r#"{ "bind_doh": "::not::an::ip::", "doh_tls_cert": "c.pem", "doh_tls_key": "k.pem" }"#,
+                false,
+            ),
+            (r#"{ "bind_udp": "127.0.0.1:99999" }"#, false),
+            (r#"{ "bind_udp": "127.0.0.1:5353" }"#, true),
+            (r#"{ "bind_doh": "127.0.0.1:8443" }"#, false),
+            (
+                r#"{ "bind_doh": "127.0.0.1:8443", "doh_tls_cert": "c.pem", "doh_tls_key": "k.pem" }"#,
+                true,
+            ),
+        ];
+        for (settings, expected_ok) in cases {
+            let raw = format!(r#"{{ "settings": {settings} }}"#);
+            let validated = validate(&raw);
+            let started = crate::matcher::RuntimePipelineConfig::from_config(
+                super::parse_config(&raw).expect("parse"),
+            )
+            .and_then(|runtime| runtime.settings.listeners());
+            assert_eq!(validated.is_ok(), expected_ok, "validate({settings})");
+            assert_eq!(
+                validated.is_ok(),
+                started.is_ok(),
+                "validate() and startup must agree on {settings}"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_rejects_runtime_compilation_errors() {
+        let err =
+            validate(r#"{ "settings": { "cache_capacity": 0 } }"#).expect_err("zero capacity");
+        assert!(format!("{err:#}").contains("cache_capacity"));
     }
 }

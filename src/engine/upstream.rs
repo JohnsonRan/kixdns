@@ -10,6 +10,9 @@ use tracing::debug;
 
 use super::Engine;
 use crate::config::Transport;
+use crate::observe::{UpstreamAttempt, UpstreamOutcome, UpstreamResult};
+
+use super::observation::Observed;
 
 /// Error indicating that all upstream attempts have been exhausted.
 /// 表示所有 upstream 尝试均已耗尽的错误。
@@ -34,6 +37,13 @@ impl std::error::Error for UpstreamFailure {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         Some(self.source.as_ref())
     }
+}
+
+/// Whether an upstream address carries a `scheme://` transport prefix, which
+/// [`parse_upstream_addr`] lets override the configured transport.
+/// 上游地址是否带 `scheme://` 传输前缀（parse_upstream_addr 以前缀覆盖配置的传输）。
+pub(crate) fn has_transport_prefix(addr: &str) -> bool {
+    addr.contains("://")
 }
 
 /// Parse upstream address with optional protocol prefix.
@@ -230,6 +240,9 @@ const DEFAULT_HEDGE_TIMEOUT_MS: u64 = 100;
 ///
 /// Returns the first successful response and the name of the winning upstream.
 /// 返回第一个成功的响应和获胜的上游名称。
+///
+/// `observed` is the observer context of the request; every attempt and its
+/// result is reported through it. / `observed` 为所属请求的观察者上下文，每次尝试及其结果都经它上报。
 pub async fn forward_upstream(
     engine: &Engine,
     packet: &[u8],
@@ -237,6 +250,7 @@ pub async fn forward_upstream(
     timeout_dur: Duration,
     transport: Option<Transport>,
     pre_split_upstreams: Option<&std::sync::Arc<Vec<std::sync::Arc<str>>>>,
+    observed: Observed<'_>,
 ) -> anyhow::Result<(Bytes, String)> {
     // 如果 transport 为 None，使用默认 UDP
     let default_transport = transport.unwrap_or(Transport::Udp);
@@ -264,36 +278,49 @@ pub async fn forward_upstream(
 
         // 解析地址中的协议前缀 / Parse protocol prefix from address
         let (addr, transport_for_addr) = parse_upstream_addr(up, default_transport);
+        if let Some((observer, ctx)) = observed {
+            observer.upstream_attempt(
+                ctx,
+                &UpstreamAttempt {
+                    upstream: addr,
+                    transport: transport_for_addr,
+                },
+            );
+        }
 
         let start = std::time::Instant::now();
-        let (res, proto): (anyhow::Result<Bytes>, &str) = match transport_for_addr {
+        // `via` is the transport that actually carried the answer (UDP may fall
+        // back to TCP) / `via` 为实际带回答案的传输（UDP 可能回退到 TCP）
+        let (res, proto, via): (anyhow::Result<Bytes>, &str, Transport) = match transport_for_addr {
             Transport::Udp => {
-                let r = forward_udp_smart(engine, packet, addr, timeout_dur, true).await;
-                (r, "udp")
+                match forward_udp_smart_via(engine, packet, addr, timeout_dur, true).await {
+                    Ok((bytes, via)) => (Ok(bytes), "udp", via),
+                    Err(err) => (Err(err), "udp", Transport::Udp),
+                }
             }
             Transport::Tcp => {
                 let r = engine.tcp_mux.send(packet, addr, timeout_dur).await;
-                (r, "tcp")
+                (r, "tcp", Transport::Tcp)
             }
             Transport::TcpUdp => {
                 // Dual-send: spawn both TCP and UDP concurrently, use first response
                 // 双发：同时发送 TCP 和 UDP，使用第一个响应
                 forward_tcp_udp_dual(engine, packet, addr, timeout_dur)
                     .await
-                    .map(|(bytes, proto)| (Ok(bytes), proto))
-                    .unwrap_or_else(|e| (Err(e), "udp"))
+                    .map(|(bytes, proto)| (Ok(bytes), proto, label_transport(proto)))
+                    .unwrap_or_else(|e| (Err(e), "udp", Transport::TcpUdp))
             }
             Transport::Doh => {
                 let r = engine.doh_client.send(packet, addr, timeout_dur).await;
-                (r, "doh")
+                (r, "doh", Transport::Doh)
             }
             Transport::Dot => {
                 let r = engine.dot_mux.send(packet, addr, timeout_dur).await;
-                (r, "dot")
+                (r, "dot", Transport::Dot)
             }
             Transport::Doq => {
                 let r = engine.doq_client.send(packet, addr, timeout_dur).await;
-                (r, "doq")
+                (r, "doq", Transport::Doq)
             }
         };
         let dur = start.elapsed();
@@ -302,6 +329,23 @@ pub async fn forward_upstream(
 
         match res {
             Ok(ref bytes) => {
+                // Quick check rcode / 快速解析响应码
+                let quick = crate::proto_utils::parse_response_quick(bytes);
+                if let Some((observer, ctx)) = observed {
+                    observer.upstream_result(
+                        ctx,
+                        &UpstreamResult {
+                            upstream: addr,
+                            transport: transport_for_addr,
+                            via,
+                            outcome: UpstreamOutcome::Success,
+                            latency: dur,
+                            rcode: quick.as_ref().map(|qr| qr.rcode),
+                            truncated: quick.as_ref().map(|qr| qr.truncated),
+                            error: None,
+                        },
+                    );
+                }
                 // 记录成功指标 / Record success metrics
                 // Increment upstream metrics - 原子操作
                 engine
@@ -314,13 +358,27 @@ pub async fn forward_upstream(
                     .metrics_last_upstream_latency_ns
                     .store(dur.as_nanos() as u64, Ordering::Relaxed);
 
-                // Quick check rcode logging
-                if let Some(qr) = crate::proto_utils::parse_response_quick(bytes) {
+                if let Some(qr) = quick {
                     tracing::debug!(upstream=%up, upstream_ns = dur.as_nanos() as u64, rcode = %qr.rcode, "upstream call succeeded");
                 }
                 return Ok((bytes.clone(), upstream_with_proto));
             }
             Err(err) => {
+                if let Some((observer, ctx)) = observed {
+                    observer.upstream_result(
+                        ctx,
+                        &UpstreamResult {
+                            upstream: addr,
+                            transport: transport_for_addr,
+                            via: transport_for_addr,
+                            outcome: UpstreamOutcome::Error,
+                            latency: dur,
+                            rcode: None,
+                            truncated: None,
+                            error: Some(&err),
+                        },
+                    );
+                }
                 // 失败时不构造 prefix，只 warn
                 tracing::warn!(upstream=%up, error=%err, elapsed_ns = dur.as_nanos() as u64, "single upstream call failed");
                 return Err(anyhow::Error::new(UpstreamFailure::new(err)));
@@ -335,6 +393,11 @@ pub async fn forward_upstream(
     // 使用 Bytes 实现低成本克隆（引用计数）而非 Vec 全量拷贝
     let packet_owned = Bytes::copy_from_slice(packet);
     let mut last_err: Option<anyhow::Error> = None;
+    // Attempts that have not reported a result yet, so losers of the race can
+    // be reported as aborted; only tracked for an observer.
+    // 尚未上报结果的尝试，用于把竞争失败者上报为已取消；仅在有观察者时跟踪。
+    let mut pending: Option<Vec<(String, Transport, std::time::Instant)>> =
+        observed.map(|_| Vec::new());
 
     // If any TCP/TCP+UDP upstream is present, avoid UDP->TCP fallback to prevent duplicate TCP sends
     // 如果同一批次已有 TCP/TCP+UDP 上游，禁用 UDP->TCP fallback，避免重复 TCP 发送
@@ -346,6 +409,23 @@ pub async fn forward_upstream(
     for up in upstreams {
         // 解析地址中的协议前缀 / Parse protocol prefix from address
         let (addr, transport_for_task) = parse_upstream_addr(&up, default_transport);
+        if let Some((observer, ctx)) = observed {
+            observer.upstream_attempt(
+                ctx,
+                &UpstreamAttempt {
+                    upstream: addr,
+                    transport: transport_for_task,
+                },
+            );
+        }
+
+        if let Some(pending) = pending.as_mut() {
+            pending.push((
+                addr.to_string(),
+                transport_for_task,
+                std::time::Instant::now(),
+            ));
+        }
 
         let engine = engine.clone();
         let packet = packet_owned.clone();
@@ -353,28 +433,31 @@ pub async fn forward_upstream(
 
         tasks.spawn(async move {
             let start = std::time::Instant::now();
-            let (proto, res) = match transport_for_task {
+            let (proto, res, via) = match transport_for_task {
                 Transport::Udp => {
-                    let r = forward_udp_smart(
+                    match forward_udp_smart_via(
                         &engine,
                         &packet,
                         &addr_owned,
                         timeout_dur,
                         !has_tcp_task,
                     )
-                    .await;
-                    ("udp", r)
+                    .await
+                    {
+                        Ok((bytes, via)) => ("udp", Ok(bytes), via),
+                        Err(err) => ("udp", Err(err), Transport::Udp),
+                    }
                 }
                 Transport::Tcp => {
                     let r = engine.tcp_mux.send(&packet, &addr_owned, timeout_dur).await;
-                    ("tcp", r)
+                    ("tcp", r, Transport::Tcp)
                 }
                 Transport::TcpUdp => {
                     // Dual-send: spawn both TCP and UDP concurrently, use first response
                     // 双发：同时发送 TCP 和 UDP，使用第一个响应
                     match forward_tcp_udp_dual(&engine, &packet, &addr_owned, timeout_dur).await {
-                        Ok((bytes, proto)) => (proto, Ok(bytes)),
-                        Err(e) => ("udp", Err(e)),
+                        Ok((bytes, proto)) => (proto, Ok(bytes), label_transport(proto)),
+                        Err(e) => ("udp", Err(e), Transport::TcpUdp),
                     }
                 }
                 Transport::Doh => {
@@ -382,18 +465,18 @@ pub async fn forward_upstream(
                         .doh_client
                         .send(&packet, &addr_owned, timeout_dur)
                         .await;
-                    ("doh", r)
+                    ("doh", r, Transport::Doh)
                 }
                 Transport::Dot => {
                     let r = engine.dot_mux.send(&packet, &addr_owned, timeout_dur).await;
-                    ("dot", r)
+                    ("dot", r, Transport::Dot)
                 }
                 Transport::Doq => {
                     let r = engine
                         .doq_client
                         .send(&packet, &addr_owned, timeout_dur)
                         .await;
-                    ("doq", r)
+                    ("doq", r, Transport::Doq)
                 }
             };
 
@@ -401,29 +484,67 @@ pub async fn forward_upstream(
             // 注意：对于 TcpUdp，计时包含两个任务的 spawn/abort 开销
             let upstream_with_proto = format!("{}:{}", proto, addr_owned);
             let dur = start.elapsed();
-            (upstream_with_proto, res, dur)
+            (
+                upstream_with_proto,
+                addr_owned,
+                transport_for_task,
+                via,
+                res,
+                dur,
+            )
         });
     }
 
     // 等待第一个成功响应 / Wait for first successful response
     while let Some(result) = tasks.join_next().await {
         match result {
-            Ok((up_proto, res, dur)) => {
+            Ok((up_proto, addr, transport_for_task, via, res, dur)) => {
+                if let Some(pending) = pending.as_mut()
+                    && let Some(idx) = pending
+                        .iter()
+                        .position(|(a, t, _)| *a == addr && *t == transport_for_task)
+                {
+                    pending.swap_remove(idx);
+                }
+                // Report the outcome of this attempt / 上报本次尝试的结果
+                let report = |outcome: UpstreamOutcome,
+                              rcode: Option<ResponseCode>,
+                              truncated: Option<bool>,
+                              error: Option<&anyhow::Error>| {
+                    if let Some((observer, ctx)) = observed {
+                        observer.upstream_result(
+                            ctx,
+                            &UpstreamResult {
+                                upstream: &addr,
+                                transport: transport_for_task,
+                                via,
+                                outcome,
+                                latency: dur,
+                                rcode,
+                                truncated,
+                                error,
+                            },
+                        );
+                    }
+                };
                 match res {
                     Ok(bytes) => {
                         // 快速解析响应码 / Quick parse response code
-                        let should_accept =
-                            if let Some(qr) = crate::proto_utils::parse_response_quick(&bytes) {
-                                match qr.rcode {
-                                    ResponseCode::NoError => true,
-                                    ResponseCode::ServFail | ResponseCode::Refused => false,
-                                    _ => true,
-                                }
-                            } else {
-                                true
-                            };
+                        let quick = crate::proto_utils::parse_response_quick(&bytes);
+                        let rcode = quick.as_ref().map(|qr| qr.rcode);
+                        let truncated = quick.as_ref().map(|qr| qr.truncated);
+                        let should_accept = if let Some(qr) = quick {
+                            match qr.rcode {
+                                ResponseCode::NoError => true,
+                                ResponseCode::ServFail | ResponseCode::Refused => false,
+                                _ => true,
+                            }
+                        } else {
+                            true
+                        };
 
                         if should_accept {
+                            report(UpstreamOutcome::Success, rcode, truncated, None);
                             engine
                                 .metrics_upstream_calls
                                 .fetch_add(1, Ordering::Relaxed);
@@ -434,6 +555,10 @@ pub async fn forward_upstream(
                                 .metrics_last_upstream_latency_ns
                                 .store(dur.as_nanos() as u64, Ordering::Relaxed);
 
+                            // The remaining attempts lose the race / 其余尝试竞争失败
+                            if let Some(pending) = pending.as_ref() {
+                                report_aborted(observed, pending);
+                            }
                             // 显式取消其他正在进行的任务
                             if !tasks.is_empty() {
                                 tasks.abort_all();
@@ -441,8 +566,10 @@ pub async fn forward_upstream(
 
                             return Ok((bytes, up_proto));
                         }
+                        report(UpstreamOutcome::Rejected, rcode, truncated, None);
                     }
                     Err(err) => {
+                        report(UpstreamOutcome::Error, None, None, Some(&err));
                         tracing::warn!(upstream=%up_proto, error=%err, elapsed_ns = dur.as_nanos() as u64, "upstream call failed, waiting for others");
                         last_err = Some(err);
                     }
@@ -455,9 +582,44 @@ pub async fn forward_upstream(
         }
     }
 
+    // Attempts whose task never reported (join error) / 任务未能上报结果的尝试（join 错误）
+    if let Some(pending) = pending.as_ref() {
+        report_aborted(observed, pending);
+    }
+
     // 所有上游都失败 / All upstreams failed
     let err = last_err.unwrap_or_else(|| anyhow::anyhow!("all upstreams failed"));
     Err(anyhow::Error::new(UpstreamFailure::new(err)))
+}
+
+/// Report every attempt still in flight as aborted / 把仍在飞的尝试上报为已取消
+fn report_aborted(observed: Observed<'_>, pending: &[(String, Transport, std::time::Instant)]) {
+    if let Some((observer, ctx)) = observed {
+        for (upstream, transport, started) in pending {
+            observer.upstream_result(
+                ctx,
+                &UpstreamResult {
+                    upstream,
+                    transport: *transport,
+                    via: *transport,
+                    outcome: UpstreamOutcome::Aborted,
+                    latency: started.elapsed(),
+                    rcode: None,
+                    truncated: None,
+                    error: None,
+                },
+            );
+        }
+    }
+}
+
+/// Transport named by a `tcp_udp` race label / `tcp_udp` 竞争标签对应的传输
+fn label_transport(label: &str) -> Transport {
+    if label == "tcp" {
+        Transport::Tcp
+    } else {
+        Transport::Udp
+    }
 }
 
 /// UDP forwarder with hedged retry and TCP fallback for better tail latency.
@@ -468,6 +630,21 @@ async fn forward_udp_smart(
     timeout_dur: Duration,
     allow_tcp_fallback: bool,
 ) -> anyhow::Result<Bytes> {
+    forward_udp_smart_via(engine, packet, upstream, timeout_dur, allow_tcp_fallback)
+        .await
+        .map(|(bytes, _)| bytes)
+}
+
+/// [`forward_udp_smart`] that also returns the transport that carried the
+/// answer: UDP, or TCP after a TC-bit retry or a UDP-failure fallback.
+/// 同 [`forward_udp_smart`]，并返回实际带回答案的传输（UDP，或 TC/失败回退后的 TCP）。
+async fn forward_udp_smart_via(
+    engine: &Engine,
+    packet: &[u8],
+    upstream: &str,
+    timeout_dur: Duration,
+    allow_tcp_fallback: bool,
+) -> anyhow::Result<(Bytes, Transport)> {
     // 获取 TCP fallback 配置（Copy bool 值，避免持有 Guard 跨 await）
     // Get TCP fallback config (Copy bool value to avoid holding Guard across await)
     let enable_tcp_fallback =
@@ -489,9 +666,13 @@ async fn forward_udp_smart(
                     && enable_tcp_fallback
                 {
                     debug!(event = "tc_flag_fallback", upstream = %upstream, "udp response truncated, retrying with tcp");
-                    return engine.tcp_mux.send(packet, upstream, timeout_dur).await;
+                    return engine
+                        .tcp_mux
+                        .send(packet, upstream, timeout_dur)
+                        .await
+                        .map(|bytes| (bytes, Transport::Tcp));
                 }
-                return Ok(bytes);
+                return Ok((bytes, Transport::Udp));
             }
             Err(err) => {
                 debug!(
@@ -505,7 +686,11 @@ async fn forward_udp_smart(
                 if idx + 1 == attempts.len() && enable_tcp_fallback {
                     // Last UDP attempt, try TCP fallback before failing.
                     debug!(event = "udp_forward_fallback_tcp", upstream = %upstream, "falling back to tcp");
-                    return engine.tcp_mux.send(packet, upstream, timeout_dur).await;
+                    return engine
+                        .tcp_mux
+                        .send(packet, upstream, timeout_dur)
+                        .await
+                        .map(|bytes| (bytes, Transport::Tcp));
                 }
             }
         }

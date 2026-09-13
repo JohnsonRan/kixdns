@@ -25,6 +25,9 @@ pub struct CompiledPipeline {
 pub struct CompiledRule {
     #[allow(dead_code)]
     pub rule_idx: usize,
+    /// Rule name from the configuration, reported to observers on fast-path matches.
+    /// 配置中的规则名，快速路径命中时上报给观察者。
+    pub rule_name: Arc<str>,
     #[allow(dead_code)]
     pub matcher_operator: MatchOperator,
     pub matchers: Vec<CompiledMatcherWithOp>,
@@ -205,6 +208,7 @@ fn compile_rule(rule: &RuntimeRule, rule_idx: usize) -> CompiledRule {
 
     CompiledRule {
         rule_idx,
+        rule_name: rule.name.clone(),
         matcher_operator: rule.matcher_operator,
         matchers,
         precomputed,
@@ -266,6 +270,8 @@ fn precompute_action(rule: &RuntimeRule) -> Option<PrecomputedAction> {
     }
 }
 
+/// Test-only shorthand for [`fast_static_match_with_rule`] without the rule name.
+#[cfg(test)]
 pub(crate) fn fast_static_match(
     pipeline: &CompiledPipeline,
     qname: &str,
@@ -274,6 +280,21 @@ pub(crate) fn fast_static_match(
     client_ip: IpAddr,
     edns_present: bool,
 ) -> Option<Decision> {
+    fast_static_match_with_rule(pipeline, qname, qtype, qclass, client_ip, edns_present)
+        .map(|(decision, _)| decision)
+}
+
+/// Like [`fast_static_match`], additionally returning the name of the rule
+/// that produced the decision.
+/// 同 [`fast_static_match`]，并返回产生该决策的规则名。
+pub(crate) fn fast_static_match_with_rule<'a>(
+    pipeline: &'a CompiledPipeline,
+    qname: &str,
+    qtype: RecordType,
+    qclass: DNSClass,
+    client_ip: IpAddr,
+    edns_present: bool,
+) -> Option<(Decision, &'a str)> {
     let candidates = pipeline.index.get_candidates(qname, qtype);
     for idx in candidates {
         let rule = pipeline.rules.get(idx)?;
@@ -288,22 +309,21 @@ pub(crate) fn fast_static_match(
         // 找到第一个匹配的规则
         // 如果它可预计算，使用快速路径；否则放弃快速路径以保持规则顺序
         if let Some(pre) = &rule.precomputed {
-            match pre {
-                PrecomputedAction::Static { rcode } => {
-                    return Some(Decision::Static {
-                        rcode: *rcode,
-                        answers: Vec::new(),
-                    });
-                }
+            let decision = match pre {
+                PrecomputedAction::Static { rcode } => Decision::Static {
+                    rcode: *rcode,
+                    answers: Vec::new(),
+                },
                 PrecomputedAction::StaticIp { ip } => {
                     let (rcode, answers) = make_static_ip_answer(qname, qtype, ip);
-                    return Some(Decision::Static { rcode, answers });
+                    Decision::Static { rcode, answers }
                 }
                 PrecomputedAction::StaticCname { target, ttl } => {
                     let (rcode, answers) = make_static_cname_answer(qname, target, *ttl);
-                    return Some(Decision::Static { rcode, answers });
+                    Decision::Static { rcode, answers }
                 }
-            }
+            };
+            return Some((decision, &rule.rule_name));
         } else {
             // 第一个匹配的规则不可预计算（如 Forward、Jump 等）
             // 放弃快速路径，让规则走正常路径以保持配置顺序

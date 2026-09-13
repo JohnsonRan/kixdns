@@ -6,6 +6,7 @@ pub mod engine;
 pub mod error_utils;
 pub mod lock;
 pub mod matcher;
+pub mod observe;
 pub mod proto_utils;
 pub mod socket_utils;
 pub mod watcher;

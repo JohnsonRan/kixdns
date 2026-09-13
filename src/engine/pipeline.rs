@@ -20,10 +20,14 @@ use crate::matcher::{
 
 use super::core::Engine;
 use super::matcher_adapter::{MatcherContext, matcher_matches};
+use super::observation::{Observed, decision_kind, report_decision, report_matched_rules};
 use super::rules::Decision;
-use super::rules::{RuleCacheEntry, calculate_rule_hash, contains_continue, fast_hash_str};
+use super::rules::{
+    RuleCacheEntry, RuleCacheRecord, calculate_rule_hash, contains_continue, fast_hash_str,
+};
 use super::types::EngineInner;
 use super::{make_static_cname_answer, make_static_ip_answer};
+use crate::observe::{RuleCacheLookup, RuleEvaluated, RulePhase};
 
 /// Request and manager references required to select a runtime pipeline.
 pub struct PipelineSelectionContext<'a> {
@@ -117,6 +121,9 @@ pub struct RuleEvaluationContext<'a> {
     pub edns_present: bool,
     pub skip_rules: Option<&'a FxHashSet<Arc<str>>>,
     pub skip_cache: bool,
+    /// Observer context of the request being evaluated; `None` disables
+    /// rule-match events. / 所属请求的观察者上下文；None 时不上报规则命中。
+    pub observed: Observed<'a>,
 }
 
 impl<'a> RuleEvaluationContext<'a> {
@@ -137,7 +144,14 @@ impl<'a> RuleEvaluationContext<'a> {
             edns_present,
             skip_rules,
             skip_cache,
+            observed: None,
         }
+    }
+
+    /// Attach the observer context of the request so rule matches are reported.
+    pub fn with_observed(mut self, observed: Observed<'a>) -> Self {
+        self.observed = observed;
+        self
     }
 }
 
@@ -160,6 +174,8 @@ impl Engine {
         request: &RuleEvaluationContext<'_>,
         decision: Decision,
         include_ip: bool,
+        matched_rules: &[Arc<str>],
+        decided_by_rule: bool,
     ) {
         let RuleEvaluationContext {
             client_ip,
@@ -211,14 +227,18 @@ impl Engine {
         // Optimization: only include client_ip in cache entry when configured or required by rule
         self.rule_cache.insert(
             hash,
-            RuleCacheEntry {
-                pipeline_id,
-                qname_hash: fast_hash_str(qname),
-                qtype: u16::from(qtype),
-                qclass: u16::from(qclass),
-                client_ip: if include_ip { Some(client_ip) } else { None },
-                decision: Arc::new(decision),
-                expires_at,
+            RuleCacheRecord {
+                entry: RuleCacheEntry {
+                    pipeline_id,
+                    qname_hash: fast_hash_str(qname),
+                    qtype: u16::from(qtype),
+                    qclass: u16::from(qclass),
+                    client_ip: if include_ip { Some(client_ip) } else { None },
+                    decision: Arc::new(decision),
+                    expires_at,
+                },
+                matched_rules: request.observed.map(|_| Arc::from(matched_rules)),
+                decided_by_rule,
             },
         );
     }
@@ -234,9 +254,9 @@ impl Engine {
             qname,
             qtype,
             qclass,
-            edns_present,
             skip_rules,
             skip_cache,
+            ..
         } = *request;
         // 1. Check Rule Cache
         // Use hash for lookup to avoid cloning String for key on every lookup
@@ -252,16 +272,130 @@ impl Engine {
         );
         let allow_rule_cache_lookup = !skip_cache && skip_rules.is_none_or(|set| set.is_empty());
 
-        if allow_rule_cache_lookup && let Some(entry) = self.rule_cache.get(&rule_hash) {
+        if allow_rule_cache_lookup && let Some(record) = self.rule_cache.get(&rule_hash) {
+            let entry = &record.entry;
             // Check validity and clean up if expired
             // 检查有效性，如果过期则清理
             if !entry.is_valid() {
                 self.rule_cache.remove(&rule_hash);
             } else if entry.matches(&pipeline.id, qname, qtype, qclass, client_ip, include_ip) {
+                if let Some((observer, ctx)) = request.observed {
+                    let recorded = record.matched_rules.as_deref();
+                    observer.rule_cache_lookup(
+                        ctx,
+                        &RuleCacheLookup {
+                            pipeline: &pipeline.id,
+                            hit: true,
+                            matched_rules: recorded.map_or(0, <[Arc<str>]>::len),
+                        },
+                    );
+                    let deciding_rule = record.decided_by_rule.then(|| recorded?.last()).flatten();
+                    if let Some(rules) = recorded {
+                        report_matched_rules(
+                            observer,
+                            ctx,
+                            &pipeline.id,
+                            rules,
+                            deciding_rule.map(|_| decision_kind(&entry.decision)),
+                            false,
+                        );
+                    }
+                    report_decision(
+                        observer,
+                        ctx,
+                        &pipeline.id,
+                        deciding_rule.map(AsRef::as_ref),
+                        &entry.decision,
+                    );
+                }
                 return (*entry.decision).clone();
             }
         }
+        if allow_rule_cache_lookup && let Some((observer, ctx)) = request.observed {
+            observer.rule_cache_lookup(
+                ctx,
+                &RuleCacheLookup {
+                    pipeline: &pipeline.id,
+                    hit: false,
+                    matched_rules: 0,
+                },
+            );
+        }
 
+        // 2. Evaluate rules in order; None means no rule decided and the
+        //    default upstream applies.
+        // 2. 按顺序求值规则；None 表示没有规则做出决策，使用默认上游。
+        let mut matched_rules: SmallVec<[Arc<str>; 4]> = SmallVec::new();
+        let decided = self.evaluate_rules(state, pipeline, request, &mut matched_rules);
+        let decided_by_rule = decided.is_some();
+        let decision = decided.unwrap_or_else(|| Decision::Forward {
+            upstream: Arc::from(state.pipeline.settings.default_upstream.as_str()),
+            pre_split_upstreams: None,
+            response_matchers: Vec::new(),
+            response_matcher_operator: crate::config::MatchOperator::And,
+            response_actions_on_match: Vec::new(),
+            response_actions_on_miss: Vec::new(),
+            rule_name: Arc::from("default"),
+            transport: Some(Transport::Udp),
+            ecs: None,
+            continue_on_match: false,
+            continue_on_miss: false,
+            allow_reuse: false,
+        });
+
+        if let Some((observer, ctx)) = request.observed {
+            report_matched_rules(
+                observer,
+                ctx,
+                &pipeline.id,
+                &matched_rules,
+                decided_by_rule.then(|| decision_kind(&decision)),
+                false,
+            );
+            report_decision(
+                observer,
+                ctx,
+                &pipeline.id,
+                decided_by_rule
+                    .then(|| matched_rules.last())
+                    .flatten()
+                    .map(AsRef::as_ref),
+                &decision,
+            );
+        }
+        self.insert_rule_cache(
+            rule_hash,
+            pipeline.id.clone(),
+            request,
+            decision.clone(),
+            include_ip,
+            &matched_rules,
+            decided_by_rule,
+        );
+        decision
+    }
+
+    /// Evaluate `pipeline`'s rules in order for `request`. Returns the first
+    /// decision, or `None` when every matching rule continued. The names of
+    /// the rules whose matchers matched are appended to `matched_rules`.
+    /// 按顺序求值规则：返回第一个决策，所有命中规则都继续时返回 None。
+    /// 匹配器命中的规则名追加到 `matched_rules`。
+    fn evaluate_rules(
+        &self,
+        state: &EngineInner,
+        pipeline: &RuntimePipeline,
+        request: &RuleEvaluationContext<'_>,
+        matched_rules: &mut SmallVec<[Arc<str>; 4]>,
+    ) -> Option<Decision> {
+        let RuleEvaluationContext {
+            client_ip,
+            qname,
+            qtype,
+            qclass,
+            edns_present,
+            skip_rules,
+            ..
+        } = *request;
         // Borrow instead of clone: state lives for the entire function, no heap alloc
         // 借用而非克隆：state 在整个函数生命周期内存活，零堆分配
         let upstream_default = &state.pipeline.settings.default_upstream;
@@ -338,8 +472,25 @@ impl Engine {
                     matcher_matches(&m.matcher, &ctx)
                 },
             );
+            if let Some((observer, observed_ctx)) = request.observed {
+                observer.rule_evaluated(
+                    observed_ctx,
+                    &RuleEvaluated {
+                        pipeline: &pipeline.id,
+                        rule: &rule.name,
+                        phase: RulePhase::Request,
+                        matched: req_match,
+                        matchers: rule.matchers.len(),
+                    },
+                );
+            }
 
             if req_match {
+                // Names are only needed for observers; skip the clone otherwise
+                // 规则名只有观察者需要，无观察者时不做克隆
+                if request.observed.is_some() {
+                    matched_rules.push(rule.name.clone());
+                }
                 // Check for multiple Forward actions using pre-computed merge result.
                 // The merge was computed at config load time (Rule::compute_merged_forward),
                 // eliminating per-request FxHashSet + format! + join overhead.
@@ -361,14 +512,7 @@ impl Engine {
                         continue_on_miss: false,
                         allow_reuse: false,
                     };
-                    self.insert_rule_cache(
-                        rule_hash,
-                        pipeline.id.clone(),
-                        request,
-                        d.clone(),
-                        include_ip,
-                    );
-                    return d;
+                    return Some(d);
                 }
 
                 // Single Forward or other actions: use original logic
@@ -381,52 +525,24 @@ impl Engine {
                                 rcode: code,
                                 answers: Vec::new(),
                             };
-                            self.insert_rule_cache(
-                                rule_hash,
-                                pipeline.id.clone(),
-                                request,
-                                d.clone(),
-                                include_ip,
-                            );
-                            return d;
+                            return Some(d);
                         }
                         Action::StaticIpResponse { ip } => {
                             let (rcode, answers) = make_static_ip_answer(qname, request.qtype, ip);
                             let d = Decision::Static { rcode, answers };
-                            self.insert_rule_cache(
-                                rule_hash,
-                                pipeline.id.clone(),
-                                request,
-                                d.clone(),
-                                include_ip,
-                            );
-                            return d;
+                            return Some(d);
                         }
                         Action::StaticCnameResponse { target, ttl } => {
                             let (rcode, answers) =
                                 make_static_cname_answer(qname, target, ttl.unwrap_or(300));
                             let d = Decision::Static { rcode, answers };
-                            self.insert_rule_cache(
-                                rule_hash,
-                                pipeline.id.clone(),
-                                request,
-                                d.clone(),
-                                include_ip,
-                            );
-                            return d;
+                            return Some(d);
                         }
                         Action::JumpToPipeline { pipeline: target } => {
                             let d = Decision::Jump {
                                 pipeline: Arc::from(target.as_str()),
                             };
-                            self.insert_rule_cache(
-                                rule_hash,
-                                pipeline.id.clone(),
-                                request,
-                                d.clone(),
-                                include_ip,
-                            );
-                            return d;
+                            return Some(d);
                         }
                         Action::Allow => {
                             let d = Decision::Forward {
@@ -443,28 +559,14 @@ impl Engine {
                                 continue_on_miss: false,
                                 allow_reuse: true,
                             };
-                            self.insert_rule_cache(
-                                rule_hash,
-                                pipeline.id.clone(),
-                                request,
-                                d.clone(),
-                                include_ip,
-                            );
-                            return d;
+                            return Some(d);
                         }
                         Action::Deny => {
                             let d = Decision::Static {
                                 rcode: ResponseCode::Refused,
                                 answers: Vec::new(),
                             };
-                            self.insert_rule_cache(
-                                rule_hash,
-                                pipeline.id.clone(),
-                                request,
-                                d.clone(),
-                                include_ip,
-                            );
-                            return d;
+                            return Some(d);
                         }
                         Action::Forward {
                             upstream,
@@ -494,14 +596,7 @@ impl Engine {
                                 continue_on_miss,
                                 allow_reuse: false,
                             };
-                            self.insert_rule_cache(
-                                rule_hash,
-                                pipeline.id.clone(),
-                                request,
-                                d.clone(),
-                                include_ip,
-                            );
-                            return d;
+                            return Some(d);
                         }
                         Action::Log { level } => {
                             super::matcher_adapter::log_match(
@@ -520,27 +615,13 @@ impl Engine {
                                     rcode: ResponseCode::NoError,
                                     answers: vec![record],
                                 };
-                                self.insert_rule_cache(
-                                    rule_hash,
-                                    pipeline.id.clone(),
-                                    request,
-                                    d.clone(),
-                                    include_ip,
-                                );
-                                return d;
+                                return Some(d);
                             }
                             let d = Decision::Static {
                                 rcode: ResponseCode::ServFail,
                                 answers: Vec::new(),
                             };
-                            self.insert_rule_cache(
-                                rule_hash,
-                                pipeline.id.clone(),
-                                request,
-                                d.clone(),
-                                include_ip,
-                            );
-                            return d;
+                            return Some(d);
                         }
                         Action::ReplaceTxtResponse { .. } => {
                             continue 'rules;
@@ -553,27 +634,82 @@ impl Engine {
             }
         }
 
-        let d = Decision::Forward {
-            upstream: Arc::from(upstream_default.as_str()),
-            pre_split_upstreams: None,
-            response_matchers: Vec::new(),
-            response_matcher_operator: crate::config::MatchOperator::And,
-            response_actions_on_match: Vec::new(),
-            response_actions_on_miss: Vec::new(),
-            rule_name: Arc::from("default"),
-            transport: Some(Transport::Udp),
-            ecs: None,
-            continue_on_match: false,
-            continue_on_miss: false,
-            allow_reuse: false,
-        };
-        self.insert_rule_cache(
-            rule_hash,
-            pipeline.id.clone(),
-            request,
-            d.clone(),
-            include_ip,
+        None
+    }
+}
+
+#[cfg(test)]
+mod observer_rule_cache_tests {
+    use std::sync::Arc;
+
+    use hickory_proto::op::{Message, MessageType, OpCode, Query};
+    use hickory_proto::rr::{Name, RecordType};
+
+    use crate::config::PipelineConfig;
+    use crate::engine::Engine;
+    use crate::matcher::RuntimePipelineConfig;
+    use crate::observe::NoopObserver;
+
+    fn runtime() -> RuntimePipelineConfig {
+        let raw = serde_json::json!({
+            "settings": { "default_upstream": "127.0.0.1:9", "min_ttl": 0 },
+            "pipelines": [{
+                "id": "main",
+                "rules": [{
+                    "name": "block",
+                    "matchers": [{ "type": "any" }],
+                    "actions": [{ "type": "static_response", "rcode": "NXDOMAIN" }]
+                }]
+            }]
+        });
+        let cfg: PipelineConfig = serde_json::from_value(raw).expect("parse config");
+        RuntimePipelineConfig::from_config(cfg).expect("runtime config")
+    }
+
+    fn query() -> Vec<u8> {
+        let mut message = Message::new(1, MessageType::Query, OpCode::Query);
+        message.add_query(Query::query(
+            Name::from_str_relaxed("example.com").unwrap(),
+            RecordType::A,
+        ));
+        message.to_vec().unwrap()
+    }
+
+    /// Collect the `matched_rules` of every rule cache record after one request.
+    async fn recorded_rules(engine: Engine) -> Vec<Option<usize>> {
+        engine
+            .handle_packet(&query(), "127.0.0.1:53000".parse().unwrap())
+            .await
+            .expect("static answer");
+        engine.rule_cache.run_pending_tasks();
+        engine
+            .rule_cache
+            .iter()
+            .map(|(_, record)| record.matched_rules.as_ref().map(|rules| rules.len()))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn rule_cache_records_no_rule_names_without_observer() {
+        let engine = Engine::new(runtime(), "test".to_string()).expect("engine");
+        let records = recorded_rules(engine).await;
+        assert!(
+            !records.is_empty(),
+            "the request must populate the rule cache"
         );
-        d
+        assert!(
+            records.iter().all(Option::is_none),
+            "matched_rules must stay None without an observer: {records:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn rule_cache_records_rule_names_with_observer() {
+        let engine = Engine::builder(runtime())
+            .observer(Arc::new(NoopObserver))
+            .build()
+            .expect("engine");
+        let records = recorded_rules(engine).await;
+        assert_eq!(records, vec![Some(1)]);
     }
 }
