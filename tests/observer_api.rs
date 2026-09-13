@@ -18,6 +18,7 @@ use hickory_proto::rr::{Name, RData, Record, RecordType};
 use hickory_proto::serialize::binary::BinDecodable;
 
 use kixdns::config::{Transport, parse_config};
+use kixdns::doh_server::run_doh_with_listener;
 use kixdns::engine::{Engine, FastPathResponse};
 use kixdns::matcher::RuntimePipelineConfig;
 use kixdns::observe::{
@@ -1329,6 +1330,208 @@ async fn tcp_fallback_reports_the_transport_that_answered() {
         "{mine:#?}"
     );
     drop(silent_udp);
+}
+
+/// Self-signed certificate and key PEM files for a DoH listener; the files
+/// live as long as the returned directory. / DoH 监听用的自签名证书与密钥 PEM 文件。
+fn make_doh_cert() -> (tempfile::TempDir, String, String) {
+    use rcgen::{CertificateParams, KeyPair, SanType};
+
+    let mut params = CertificateParams::new(vec!["localhost".to_string()]).unwrap();
+    params
+        .subject_alt_names
+        .push(SanType::IpAddress(std::net::IpAddr::V4(
+            std::net::Ipv4Addr::LOCALHOST,
+        )));
+    let key_pair = KeyPair::generate().expect("generate key pair");
+    let cert = params.self_signed(&key_pair).expect("self-signed cert");
+
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    let cert_path = dir.path().join("cert.pem");
+    let key_path = dir.path().join("key.pem");
+    std::fs::write(&cert_path, cert.pem()).expect("write cert");
+    std::fs::write(&key_path, key_pair.serialize_pem()).expect("write key");
+    (
+        dir,
+        cert_path.to_string_lossy().into_owned(),
+        key_path.to_string_lossy().into_owned(),
+    )
+}
+
+/// Start a DoH listener for `engine` on an ephemeral port; returns the port
+/// and the certificate directory that must outlive the server.
+/// 在临时端口上为 `engine` 启动 DoH 监听；返回端口与需存活的证书目录。
+async fn start_doh(engine: Engine) -> (u16, tempfile::TempDir) {
+    let (dir, cert_path, key_path) = make_doh_cert();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind doh listener");
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        let _ = run_doh_with_listener(
+            listener,
+            &cert_path,
+            &key_path,
+            engine,
+            "/dns-query".to_string(),
+        )
+        .await;
+    });
+    // Let the server load its certificate and enter the accept loop
+    // 等服务器加载证书并进入 accept 循环
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    (port, dir)
+}
+
+/// POST a DNS query through the DoH listener (RFC 8484 §4.1) and return the
+/// wire response. / 通过 DoH 监听以 POST 发送查询并返回线上应答。
+async fn doh_query(client: &reqwest::Client, port: u16, qname: &str) -> Vec<u8> {
+    let response = client
+        .post(format!("https://127.0.0.1:{port}/dns-query"))
+        .header("content-type", "application/dns-message")
+        .body(query(qname))
+        .send()
+        .await
+        .expect("doh request");
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    response.bytes().await.expect("doh body").to_vec()
+}
+
+#[tokio::test]
+async fn doh_listener_reports_the_same_lifecycle_as_in_process_requests() {
+    let (upstream, _echo) = spawn_echo_upstream(60).await;
+    let raw = serde_json::json!({
+        "settings": { "default_upstream": "127.0.0.1:9", "min_ttl": 0 },
+        "pipelines": [{
+            "id": "main",
+            "rules": [{
+                "name": "fwd",
+                "matchers": [{ "type": "any" }],
+                "actions": [{ "type": "forward", "upstream": upstream, "transport": "udp" }]
+            }]
+        }]
+    })
+    .to_string();
+    let (engine, recorder) = observed_engine(&raw);
+    let (port, _cert_dir) = start_doh(engine.clone()).await;
+    let client = reqwest::Client::builder()
+        .danger_accept_invalid_certs(true)
+        .timeout(Duration::from_secs(5))
+        .build()
+        .expect("build client");
+    recorder.drain();
+
+    // Cache miss over DoH: the DoH listener uses the fast path first and
+    // falls through to the async path, which reports the full lifecycle
+    // exactly as an in-process handle_packet does.
+    // DoH 上的缓存未命中：监听器先走快速路径再回落到异步路径，生命周期与进程内 handle_packet 一致。
+    let response = doh_query(&client, port, "doh.example").await;
+    assert_eq!(rcode_of(&response), ResponseCode::NoError);
+    let events = recorder.drain();
+    let id = request_id_for(&events, "doh.example");
+    let mine = events_of(&events, id);
+    let Some(Event::Started {
+        qname, background, ..
+    }) = mine.first()
+    else {
+        panic!("first event must be request_started: {mine:#?}");
+    };
+    assert_eq!(qname, "doh.example");
+    assert!(!background);
+    assert_eq!(
+        mine[1..],
+        [
+            Event::Pipeline {
+                id,
+                pipeline: "main".into()
+            },
+            Event::CacheLookup { id },
+            Event::CacheMiss { id },
+            Event::RuleCacheLookup {
+                id,
+                pipeline: "main".into(),
+                hit: false,
+                matched_rules: 0,
+            },
+            Event::RuleEvaluated {
+                id,
+                pipeline: "main".into(),
+                rule: "fwd".into(),
+                phase: RulePhase::Request,
+                matched: true,
+                matchers: 1,
+            },
+            Event::Rule {
+                id,
+                pipeline: "main".into(),
+                rule: "fwd".into(),
+                phase: RulePhase::Request,
+                decision: DecisionKind::Forward,
+                fast_path: false,
+            },
+            Event::Decision {
+                id,
+                pipeline: "main".into(),
+                rule: Some("fwd".into()),
+                detail: Detail::Forward {
+                    upstream: upstream.clone(),
+                    transport: Some(Transport::Udp),
+                },
+            },
+            Event::UpstreamAttempt {
+                id,
+                upstream: upstream.clone(),
+                transport: Transport::Udp,
+            },
+            Event::UpstreamResult {
+                id,
+                upstream: upstream.clone(),
+                transport: Transport::Udp,
+                via: Transport::Udp,
+                outcome: UpstreamOutcome::Success,
+                rcode: Some(ResponseCode::NoError),
+                truncated: Some(false),
+                has_error: false,
+            },
+            finished(id),
+        ]
+    );
+    // Exactly one request was reported for this query / 该查询只上报了一个请求
+    let started = events
+        .iter()
+        .filter(|event| matches!(event, Event::Started { qname, .. } if qname == "doh.example"))
+        .count();
+    let finished_count = events
+        .iter()
+        .filter(|event| matches!(event, Event::Finished { id: fid, .. } if *fid == id))
+        .count();
+    assert_eq!((started, finished_count), (1, 1), "{events:#?}");
+
+    // Cache hit over DoH is answered on the fast path and reported in one batch
+    // DoH 上的缓存命中由快速路径应答，一次性上报
+    let response = doh_query(&client, port, "doh.example").await;
+    assert_eq!(rcode_of(&response), ResponseCode::NoError);
+    let events = recorder.drain();
+    let id = request_id_for(&events, "doh.example");
+    let mine = events_of(&events, id);
+    assert!(matches!(mine.first(), Some(Event::Started { .. })));
+    assert_eq!(
+        mine[1..],
+        [
+            Event::Pipeline {
+                id,
+                pipeline: "main".into()
+            },
+            Event::CacheLookup { id },
+            Event::CacheHit {
+                id,
+                kind: CacheHitKind::Fresh,
+                has_remaining_ttl: true,
+                original_ttl: Some(Duration::from_secs(60)),
+            },
+            finished(id),
+        ]
+    );
 }
 
 #[tokio::test]
