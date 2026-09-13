@@ -389,7 +389,11 @@ impl EngineObserver for NoopObserver {}
 
 /// Reference observer that emits every event as a `tracing` event at
 /// `DEBUG` level under the `kixdns::observe` target, with the event kind in
-/// the `event` field. Enable it with `--debug` or
+/// the `event` field.
+///
+/// The `kixdns` binary installs it when started with `--debug`. Library users
+/// install it themselves via `Engine::builder(cfg).observer(Arc::new(TracingObserver))`;
+/// nothing is installed by default. Narrow the output with
 /// `RUST_LOG=kixdns::observe=debug`.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct TracingObserver;

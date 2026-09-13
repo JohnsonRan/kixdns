@@ -13,6 +13,7 @@ use tracing_subscriber::{EnvFilter, fmt, layer::SubscriberExt, util::SubscriberI
 use kixdns::config::load_config_with_source;
 use kixdns::engine::{Engine, FastPathResponse, PreParsedData, engine_helpers};
 use kixdns::matcher::RuntimePipelineConfig;
+use kixdns::observe::TracingObserver;
 use kixdns::proto_utils::{is_standard_query_header, truncate_udp_response};
 use kixdns::watcher;
 
@@ -155,7 +156,13 @@ async fn run_dns_server(
             None
         };
 
-    let engine = Engine::new(cfg, listener_label.clone()).context("initialize DNS engine")?;
+    // --debug installs the reference observer so engine events show up under
+    // the kixdns::observe tracing target / --debug 安装参考观察者，引擎事件出现在 kixdns::observe 目标下
+    let mut builder = Engine::builder(cfg).listener_label(listener_label.clone());
+    if debug {
+        builder = builder.observer(Arc::new(TracingObserver));
+    }
+    let engine = builder.build().context("initialize DNS engine")?;
     engine.notify_config_loaded(&config, &config_source);
     drop(config_source);
 
