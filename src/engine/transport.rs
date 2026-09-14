@@ -41,6 +41,15 @@ fn unix_time_millis() -> u64 {
         })
 }
 
+/// Least budget worth spending on a transparent retry over a fresh connection.
+/// A retry has to reconnect (SYN, plus a TLS handshake for DoT and DoH) and
+/// then wait for an answer; with less than this left it cannot complete on a
+/// realistic path and would only add a second failure after the caller's
+/// deadline. The caller's deadline itself is never extended.
+/// 值得为透明重试花的最小剩余预算。重试要先重连（SYN，DoT/DoH 还有 TLS 握手）再等应答，
+/// 剩余不足这个值时现实路径上跑不完，只会在调用方截止后再失败一次。绝不延长调用方的截止。
+const MIN_RETRY_BUDGET: Duration = Duration::from_millis(50);
+
 /// Type alias for UDP inflight request tracking
 /// ID -> (OriginalID, ExpectedAddr, SentQuery, Sender)
 /// The sent query (ID already rewritten) stays in the entry so the reader can
@@ -78,135 +87,188 @@ struct UdpSocketState {
 }
 
 pub struct UdpClient {
+    /// IPv4 sockets, one ephemeral port each. / IPv4 socket，各占一个临时端口。
     pool: Vec<UdpSocketState>,
+    /// IPv6 sockets (IPV6_V6ONLY), built on the first query to an IPv6 upstream
+    /// so a deployment without one pays for nothing.
+    /// IPv6 socket（IPV6_V6ONLY），第一次查询 IPv6 上游时才建立，
+    /// 没有 IPv6 上游的部署不付出任何代价。
+    pool_v6: tokio::sync::OnceCell<Vec<UdpSocketState>>,
+    pool_size: usize,
 }
 
 impl UdpClient {
     pub fn new(size: usize) -> anyhow::Result<Self> {
         // Prevent port exhaustion by enforcing minimum pool size
         let effective_size = if size == 0 { 1 } else { size };
-        let mut pool = Vec::with_capacity(effective_size);
-        for idx in 0..effective_size {
-            // Use socket2 to set buffer sizes
-            let socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))
-                .context("create UDP pool socket")?;
-            // Set buffer sizes to 4MB to prevent packet loss under load
-            if let Err(e) = socket.set_recv_buffer_size(4 * 1024 * 1024) {
-                warn!("failed to set udp recv buffer size: {}", e);
-            }
-            if let Err(e) = socket.set_send_buffer_size(4 * 1024 * 1024) {
-                warn!("failed to set udp send buffer size: {}", e);
-            }
-            let bind_addr = SocketAddr::from(([0, 0, 0, 0], 0));
+        Ok(Self {
+            pool: Self::build_pool(
+                effective_size,
+                Domain::IPV4,
+                SocketAddr::from(([0, 0, 0, 0], 0)),
+            )?,
+            pool_v6: tokio::sync::OnceCell::new(),
+            pool_size: effective_size,
+        })
+    }
+
+    /// 建立一个地址族的完整 socket 池 / Build the whole socket pool of one family
+    ///
+    /// 先把所有 socket 建出来，全部成功之后才启动接收任务：中途失败时已经建好的
+    /// socket 随错误一起丢弃，不会留下收不回的 fd 与任务。
+    /// Every socket is created first and the readers start only once they have
+    /// all succeeded: on a failure part way through, the sockets created so far
+    /// are dropped with the error, leaving no unreachable descriptors or tasks.
+    fn build_pool(
+        size: usize,
+        domain: Domain,
+        bind_addr: SocketAddr,
+    ) -> anyhow::Result<Vec<UdpSocketState>> {
+        let mut sockets = Vec::with_capacity(size);
+        for _ in 0..size {
+            sockets.push(Self::create_socket(domain, bind_addr)?);
+        }
+        Ok(sockets
+            .into_iter()
+            .enumerate()
+            .map(|(idx, socket)| Self::spawn_reader(idx, socket))
+            .collect())
+    }
+
+    /// 建立一个池内 socket，不启动接收任务 / Create one pool socket without its reader
+    fn create_socket(
+        domain: Domain,
+        bind_addr: SocketAddr,
+    ) -> anyhow::Result<Arc<tokio::net::UdpSocket>> {
+        // Use socket2 to set buffer sizes
+        let socket = Socket::new(domain, Type::DGRAM, Some(Protocol::UDP))
+            .context("create UDP pool socket")?;
+        // IPv6 socket 只收发 IPv6：IPv4 上游始终走 IPv4 池，两边互不重叠。
+        // Keep the IPv6 socket to IPv6 only: IPv4 upstreams always use the IPv4
+        // pool, so the two never overlap.
+        if domain == Domain::IPV6 {
             socket
-                .bind(&bind_addr.into())
-                .context("bind UDP pool socket")?;
-            socket
-                .set_nonblocking(true)
-                .context("set UDP pool socket nonblocking")?;
+                .set_only_v6(true)
+                .context("set UDP pool socket IPV6_V6ONLY")?;
+        }
+        // Set buffer sizes to 4MB to prevent packet loss under load
+        if let Err(e) = socket.set_recv_buffer_size(4 * 1024 * 1024) {
+            warn!("failed to set udp recv buffer size: {}", e);
+        }
+        if let Err(e) = socket.set_send_buffer_size(4 * 1024 * 1024) {
+            warn!("failed to set udp send buffer size: {}", e);
+        }
+        socket
+            .bind(&bind_addr.into())
+            .context("bind UDP pool socket")?;
+        socket
+            .set_nonblocking(true)
+            .context("set UDP pool socket nonblocking")?;
 
-            let std_sock: std::net::UdpSocket = socket.into();
-            let socket = Arc::new(
-                tokio::net::UdpSocket::from_std(std_sock)
-                    .context("create Tokio UDP pool socket")?,
-            );
-            let inflight = Arc::new(DashMap::with_hasher(FxBuildHasher));
+        let std_sock: std::net::UdpSocket = socket.into();
+        Ok(Arc::new(
+            tokio::net::UdpSocket::from_std(std_sock).context("create Tokio UDP pool socket")?,
+        ))
+    }
 
-            let state = UdpSocketState {
-                socket: socket.clone(),
-                inflight: inflight.clone(),
-            };
-            pool.push(state);
+    /// 为一个建好的 socket 启动接收任务 / Start the reader task of a ready socket
+    fn spawn_reader(idx: usize, socket: Arc<tokio::net::UdpSocket>) -> UdpSocketState {
+        let inflight = Arc::new(DashMap::with_hasher(FxBuildHasher));
 
-            let socket_clone = socket.clone();
-            let inflight_clone = inflight.clone();
-            tokio::spawn(async move {
-                // Use BytesMut for efficient buffer management
-                let mut buf = BytesMut::with_capacity(4096);
-                loop {
-                    // Reset buffer: keep capacity but length=0
-                    // 重置缓冲区：保留容量但长度设为 0
-                    buf.clear();
+        let state = UdpSocketState {
+            socket: socket.clone(),
+            inflight: inflight.clone(),
+        };
 
-                    // Use recv_buf_from to write directly into uninitialized memory part of BytesMut
-                    // avoid zero-filling overhead from resize()
-                    // 使用 recv_buf_from 直接写入 BytesMut 的未初始化内存部分，避免 resize() 的置零开销
-                    if buf.capacity() < 4096 {
-                        buf.reserve(4096 - buf.capacity());
-                    }
+        let socket_clone = socket.clone();
+        let inflight_clone = inflight.clone();
+        tokio::spawn(async move {
+            // Use BytesMut for efficient buffer management
+            let mut buf = BytesMut::with_capacity(4096);
+            loop {
+                // Reset buffer: keep capacity but length=0
+                // 重置缓冲区：保留容量但长度设为 0
+                buf.clear();
 
-                    match socket_clone.recv_buf_from(&mut buf).await {
-                        Ok((_len, src)) => {
-                            let len = buf.len();
-                            if len >= 2 {
-                                let id = u16::from_be_bytes([buf[0], buf[1]]);
-                                // 修复：使用 Entry API 原子操作，避免 remove-then-insert 导致的竞态条件
-                                // Fix: Use Entry API for atomic operations to avoid remove-then-insert race condition
-                                if let entry::Entry::Occupied(entry) = inflight_clone.entry(id) {
-                                    let (_, expected_addr, query, _) = entry.get();
-                                    if src != *expected_addr {
-                                        // Address mismatch: keep entry and wait for correct response
-                                        // 地址不匹配：保留条目等待正确响应（可能是网络攻击或路由异常）
-                                        tracing::warn!(
+                // Use recv_buf_from to write directly into uninitialized memory part of BytesMut
+                // avoid zero-filling overhead from resize()
+                // 使用 recv_buf_from 直接写入 BytesMut 的未初始化内存部分，避免 resize() 的置零开销
+                if buf.capacity() < 4096 {
+                    buf.reserve(4096 - buf.capacity());
+                }
+
+                match socket_clone.recv_buf_from(&mut buf).await {
+                    Ok((_len, src)) => {
+                        let len = buf.len();
+                        if len >= 2 {
+                            let id = u16::from_be_bytes([buf[0], buf[1]]);
+                            // 修复：使用 Entry API 原子操作，避免 remove-then-insert 导致的竞态条件
+                            // Fix: Use Entry API for atomic operations to avoid remove-then-insert race condition
+                            if let entry::Entry::Occupied(entry) = inflight_clone.entry(id) {
+                                let (_, expected_addr, query, _) = entry.get();
+                                if src != *expected_addr {
+                                    // Address mismatch: keep entry and wait for correct response
+                                    // 地址不匹配：保留条目等待正确响应（可能是网络攻击或路由异常）
+                                    tracing::warn!(
+                                        socket_idx = idx,
+                                        response_id = id,
+                                        expected_addr = %expected_addr,
+                                        actual_addr = %src,
+                                        "UDP response address mismatch, possible spoofing or routing anomaly"
+                                    );
+                                } else if !crate::proto_utils::question_matches(query, &buf) {
+                                    // RFC 5452 §9.1: matching ID and address are not enough,
+                                    // the question must match too. Keep waiting for the real one.
+                                    // RFC 5452 §9.1：ID 和地址相符还不够，question 段也必须一致；
+                                    // 保留条目继续等待真正的应答。
+                                    tracing::warn!(
+                                        socket_idx = idx,
+                                        response_id = id,
+                                        upstream = %src,
+                                        "UDP response question mismatch, possible spoofing"
+                                    );
+                                } else {
+                                    let (_, (original_id, _, _, tx)) = entry.remove_entry();
+
+                                    // Restore original TXID
+                                    let orig_bytes = original_id.to_be_bytes();
+                                    buf[0] = orig_bytes[0];
+                                    buf[1] = orig_bytes[1];
+
+                                    // 零拷贝优化：使用 split_to 复用已有容量，避免分配新内存
+                                    let response = buf.split_to(len).freeze();
+                                    let resp_len = response.len();
+
+                                    if tx.send(Ok(response)).is_err() {
+                                        tracing::debug!(
                                             socket_idx = idx,
+                                            original_id = original_id,
                                             response_id = id,
-                                            expected_addr = %expected_addr,
-                                            actual_addr = %src,
-                                            "UDP response address mismatch, possible spoofing or routing anomaly"
-                                        );
-                                    } else if !crate::proto_utils::question_matches(query, &buf) {
-                                        // RFC 5452 §9.1: matching ID and address are not enough,
-                                        // the question must match too. Keep waiting for the real one.
-                                        // RFC 5452 §9.1：ID 和地址相符还不够，question 段也必须一致；
-                                        // 保留条目继续等待真正的应答。
-                                        tracing::warn!(
-                                            socket_idx = idx,
-                                            response_id = id,
-                                            upstream = %src,
-                                            "UDP response question mismatch, possible spoofing"
+                                            response_len = resp_len,
+                                            "Failed to send UDP response, channel already closed"
                                         );
                                     } else {
-                                        let (_, (original_id, _, _, tx)) = entry.remove_entry();
-
-                                        // Restore original TXID
-                                        let orig_bytes = original_id.to_be_bytes();
-                                        buf[0] = orig_bytes[0];
-                                        buf[1] = orig_bytes[1];
-
-                                        // 零拷贝优化：使用 split_to 复用已有容量，避免分配新内存
-                                        let response = buf.split_to(len).freeze();
-                                        let resp_len = response.len();
-
-                                        if tx.send(Ok(response)).is_err() {
-                                            tracing::debug!(
-                                                socket_idx = idx,
-                                                original_id = original_id,
-                                                response_id = id,
-                                                response_len = resp_len,
-                                                "Failed to send UDP response, channel already closed"
-                                            );
-                                        } else {
-                                            tracing::trace!(
-                                                socket_idx = idx,
-                                                original_id = original_id,
-                                                response_id = id,
-                                                response_len = resp_len,
-                                                "UDP response sent successfully"
-                                            );
-                                        }
+                                        tracing::trace!(
+                                            socket_idx = idx,
+                                            original_id = original_id,
+                                            response_id = id,
+                                            response_len = resp_len,
+                                            "UDP response sent successfully"
+                                        );
                                     }
                                 }
                             }
                         }
-                        Err(e) => {
-                            tracing::error!("UDP pool recv error: {}", e);
-                            tokio::time::sleep(Duration::from_millis(100)).await;
-                        }
+                    }
+                    Err(e) => {
+                        tracing::error!("UDP pool recv error: {}", e);
+                        tokio::time::sleep(Duration::from_millis(100)).await;
                     }
                 }
-            });
-        }
-        Ok(Self { pool })
+            }
+        });
+
+        state
     }
 
     #[inline]
@@ -216,7 +278,24 @@ impl UdpClient {
         upstream: &str,
         timeout_dur: Duration,
     ) -> anyhow::Result<Bytes> {
-        if self.pool.is_empty() {
+        let addr: SocketAddr = upstream.parse().context("invalid upstream address")?;
+        // 按目标地址族选池：IPv4 路径只多一次判别
+        // Pick the pool by address family; the IPv4 path only gains one check.
+        let pool = if addr.is_ipv6() {
+            self.pool_v6
+                .get_or_try_init(|| async {
+                    Self::build_pool(
+                        self.pool_size,
+                        Domain::IPV6,
+                        SocketAddr::from((std::net::Ipv6Addr::UNSPECIFIED, 0)),
+                    )
+                })
+                .await
+                .context("create the IPv6 UDP pool")?
+        } else {
+            &self.pool
+        };
+        if pool.is_empty() {
             return Err(anyhow::anyhow!("UDP pool not initialized"));
         }
 
@@ -229,9 +308,8 @@ impl UdpClient {
         // 从线程本地 RNG 取一次 32 位：高 16 位随机选 socket（池内每个 socket 各占
         // 一个临时端口），低 16 位作为 ID 起点。
         let draw: u32 = rand::random();
-        let idx = (draw >> 16) as usize % self.pool.len();
-        let state = &self.pool[idx];
-        let addr: SocketAddr = upstream.parse().context("invalid upstream address")?;
+        let idx = (draw >> 16) as usize % pool.len();
+        let state = &pool[idx];
 
         if packet.len() < 2 {
             return Err(anyhow::anyhow!("packet too short"));
@@ -496,7 +574,7 @@ impl TcpMultiplexer {
                 let threshold = client.health_threshold.load(Ordering::Acquire);
                 let errors = client.consecutive_errors.fetch_add(1, Ordering::Release) + 1;
 
-                if errors >= threshold {
+                if threshold > 0 && errors >= threshold {
                     warn!(
                         upstream = %client.upstream,
                         consecutive_errors = errors,
@@ -738,6 +816,10 @@ impl TcpMuxClient {
     /// 当错误阈值超过时，连接会被重置，错误计数器会被清零以避免下次错误时立即重新触发。
     async fn record_error(&self) -> bool {
         let errors = self.consecutive_errors.fetch_add(1, Ordering::Release) + 1;
+        // 阈值 0 表示禁用健康检查（README 与 config.rs 如此描述），
+        // 而不是"每次错误都重置连接"。
+        // A threshold of 0 disables the health check, as README and config.rs
+        // describe, rather than resetting the connection on every error.
         let threshold = self.health_threshold.load(Ordering::Acquire);
 
         debug!(
@@ -748,7 +830,7 @@ impl TcpMuxClient {
         );
 
         // Check if threshold exceeded / 检查是否超过阈值
-        if errors >= threshold {
+        if threshold > 0 && errors >= threshold {
             warn!(
                 upstream = %self.upstream,
                 consecutive_errors = errors,
@@ -840,36 +922,25 @@ impl TcpMuxClient {
         match self.send_attempt(packet, timeout_dur).await {
             Ok(res) => Ok(res),
             Err(err) => {
-                // TRANSPARENT RETRY: If connection was reused and failed with transport error, retry once with fresh connection
-                // 透明重试：如果连接是复用的并且因传输错误失败，则使用新连接重试一次
+                // TRANSPARENT RETRY: If connection was reused and failed with transport error,
+                // retry once with a fresh connection, within what is left of the budget
+                // 透明重试：如果连接是复用的并且因传输错误失败，则在剩余预算内用新连接重试一次
                 if is_reused {
-                    let elapsed = start.elapsed();
-                    // Calculate remaining budget, but ensure at least 1.5s for the fresh attempt
-                    // 计算剩余预算，但确认为新尝试保留至少 1.5s
-                    let remaining = if timeout_dur > elapsed {
-                        timeout_dur - elapsed
-                    } else {
-                        Duration::from_millis(0)
-                    };
+                    let remaining = timeout_dur.saturating_sub(start.elapsed());
+                    if remaining < MIN_RETRY_BUDGET {
+                        return Err(err);
+                    }
 
-                    // Only retry if we have budget OR if we decide reliability > strict timeout
-                    // Strategy: If剩余时间 < 1s, we grant a "grace period" of 1s to save the query
-                    let retry_timeout = if remaining.as_millis() < 1000 {
-                        Duration::from_millis(1500)
-                    } else {
-                        remaining
-                    };
-
-                    tracing::warn!(
+                    debug!(
                         upstream = %self.upstream,
                         error = %err,
-                        retry_timeout_ms = retry_timeout.as_millis(),
+                        retry_timeout_ms = remaining.as_millis() as u64,
                         "Connection reuse failed, performing transparent retry with fresh connection"
                     );
 
                     // Connection should have been reset by send_attempt already upon error
                     // send_attempt 出错时连接应该已经被重置
-                    return self.send_attempt(packet, retry_timeout).await;
+                    return self.send_attempt(packet, remaining).await;
                 }
                 Err(err)
             }
@@ -889,9 +960,11 @@ impl TcpMuxClient {
             self.last_health_check_time.store(now, Ordering::Relaxed);
         }
 
-        // 1. Ensure connection exists (acquires connection-level permit if needed)
-        // 确保连接存在（如果需要则获取连接级别 permit）
-        self.ensure_connection().await?;
+        // 1. Ensure connection exists (acquires connection-level permit if needed),
+        //    within what is left of the budget
+        // 确保连接存在（如果需要则获取连接级别 permit），受剩余预算约束
+        self.ensure_connection(timeout_dur.saturating_sub(start.elapsed()))
+            .await?;
 
         let elapsed = start.elapsed();
         if elapsed >= timeout_dur {
@@ -1044,7 +1117,11 @@ impl TcpMuxClient {
     /// - 连接生命周期内持有
     /// - 连接关闭/重置时释放
     /// - 允许同一连接上无限请求（TCP 多路复用）
-    async fn ensure_connection(&self) -> anyhow::Result<()> {
+    ///
+    /// `budget` bounds the connect; on failure the lock and the permit are
+    /// released immediately.
+    /// `budget` 约束建连；失败时立即释放锁和 permit。
+    async fn ensure_connection(&self, budget: Duration) -> anyhow::Result<()> {
         // First, check if we need to reconnect based on error state
         // 首先，根据错误状态检查是否需要重连
         let errors = self.consecutive_errors.load(Ordering::Acquire);
@@ -1069,11 +1146,16 @@ impl TcpMuxClient {
                 .try_acquire()
                 .ok_or_else(|| anyhow::anyhow!("tcp connection limit exceeded"))?;
 
-            // Establish TCP connection
-            // 建立 TCP 连接
-            let stream = TcpStream::connect(&*self.upstream)
-                .await
-                .map_err(|e| anyhow::anyhow!("tcp connect failed: {}", e))?;
+            // Establish TCP connection within the budget. Unbounded, a blackholed
+            // SYN blocks here until the kernel gives up (minutes) while every
+            // other request on this client waits for the lock.
+            // 在预算内建立 TCP 连接。不设限时 SYN 被黑洞会在此阻塞到内核放弃（分钟级），
+            // 期间该客户端的其他请求都在等这把锁。
+            let stream = match timeout(budget, TcpStream::connect(&*self.upstream)).await {
+                Ok(Ok(stream)) => stream,
+                Ok(Err(e)) => anyhow::bail!("tcp connect failed: {e}"),
+                Err(_) => anyhow::bail!("tcp connect timeout after {}ms", budget.as_millis()),
+            };
 
             // Configure socket options for robustness
             // 配置 socket 选项以增强健壮性
@@ -1257,7 +1339,21 @@ impl std::fmt::Display for DohHttpStatusError {
 
 impl std::error::Error for DohHttpStatusError {}
 
-pub struct DohClient {
+/// One DoH upstream's state: its own reqwest client (connection pool) and its
+/// consecutive transport-error count. Rebuilding a pool after repeated
+/// failures therefore only evicts that upstream's connections; the other DoH
+/// upstreams keep their keep-alive connections.
+/// 单个 DoH 上游的状态：独立的 reqwest 客户端（连接池）和连续传输错误计数。连续失败后
+/// 重建连接池只影响该上游，其它 DoH 上游的 keep-alive 连接不受牵连。
+/// 超过这个数量后，新增上游时顺带清理长期不用的条目
+/// Past this many entries, looking an upstream up also prunes the idle ones
+const DOH_UPSTREAM_PRUNE_AT: usize = 32;
+/// 多久没被用过就算可以清理 / How long an entry must sit unused to be pruned
+const DOH_UPSTREAM_IDLE: Duration = Duration::from_secs(600);
+/// 两次清理之间的最小间隔 / Shortest gap between two prunes
+const DOH_UPSTREAM_PRUNE_EVERY: Duration = Duration::from_secs(60);
+
+struct DohUpstream {
     /// Hot-swappable reqwest client (its connection pool). Replacing it drops the
     /// old pool, which is the only way to evict half-open/dead connections that
     /// reqwest cannot detect (DoH uses POST, which hyper won't auto-retry).
@@ -1265,15 +1361,24 @@ pub struct DohClient {
     /// 这是清除 reqwest 无法检测的半开/死连接的唯一手段
     /// （DoH 用 POST，hyper 不会自动重试）
     client: ArcSwap<DohHttpClient>,
+    /// Consecutive transport errors; cleared by a success or a rebuild.
+    /// 连续传输错误数；成功或重建后清零。
+    consecutive_errors: AtomicUsize,
+    /// 最近一次使用的时刻，用于清理热重载换掉的旧上游
+    /// When the entry was last used, so upstreams dropped by a reload can be pruned
+    last_used_millis: AtomicU64,
+}
+
+pub struct DohClient {
+    /// Per-upstream state, created the first time an upstream is used.
+    /// 按上游划分的状态，首次使用该上游时创建。
+    upstreams: DashMap<Arc<str>, Arc<DohUpstream>, FxBuildHasher>,
     pool_max_idle_per_host: usize,
-    /// Per-upstream consecutive transport-error counts. Mirrors the mux clients'
-    /// consecutive_errors, but keyed by upstream since the reqwest pool is per-host.
-    /// per-upstream 连续传输错误计数。对齐 mux 的 consecutive_errors，
-    /// 因 reqwest 连接池是 per-host 的，按 upstream 维度计数
-    error_counts: DashMap<Arc<str>, usize, FxBuildHasher>,
     /// Threshold of consecutive transport errors that triggers a pool rebuild.
     /// 触发连接池重建的连续传输错误阈值
     health_error_threshold: usize,
+    /// 上次清理空闲上游的时刻 / When idle upstreams were last pruned
+    last_prune_millis: AtomicU64,
 }
 
 impl DohClient {
@@ -1282,10 +1387,10 @@ impl DohClient {
         health_error_threshold: usize,
     ) -> anyhow::Result<Self> {
         Ok(Self {
-            client: ArcSwap::from_pointee(Self::build_client(pool_max_idle_per_host)?),
+            upstreams: DashMap::with_hasher(FxBuildHasher),
             pool_max_idle_per_host,
-            error_counts: DashMap::with_hasher(FxBuildHasher),
             health_error_threshold,
+            last_prune_millis: AtomicU64::new(unix_time_millis()),
         })
     }
 
@@ -1301,6 +1406,77 @@ impl DohClient {
             .context("build doh http client")
     }
 
+    /// State for `upstream`, built on first sight. One map read per query on
+    /// the hot path; the key is allocated once per upstream.
+    /// `upstream` 的状态，首次遇到时创建。热路径每查询一次 map 读取；key 每个上游只分配一次。
+    fn upstream(&self, upstream: &str) -> anyhow::Result<Arc<DohUpstream>> {
+        let now = unix_time_millis();
+        let state = self.lookup_or_create(upstream, now)?;
+        // 清理放在查表之后：此刻没有持有任何分片守卫，retain 不会和自己抢锁。
+        // Prune after the lookup: no shard guard is held here, so retain cannot
+        // contend with this very call.
+        self.prune_idle_upstreams(now);
+        Ok(state)
+    }
+
+    fn lookup_or_create(&self, upstream: &str, now: u64) -> anyhow::Result<Arc<DohUpstream>> {
+        if let Some(state) = self.upstreams.get(upstream) {
+            state.last_used_millis.store(now, Ordering::Relaxed);
+            return Ok(Arc::clone(&state));
+        }
+        match self.upstreams.entry(Arc::from(upstream)) {
+            entry::Entry::Occupied(existing) => {
+                existing
+                    .get()
+                    .last_used_millis
+                    .store(now, Ordering::Relaxed);
+                Ok(Arc::clone(existing.get()))
+            }
+            entry::Entry::Vacant(slot) => {
+                let state = Arc::new(DohUpstream {
+                    client: ArcSwap::from_pointee(Self::build_client(self.pool_max_idle_per_host)?),
+                    consecutive_errors: AtomicUsize::new(0),
+                    last_used_millis: AtomicU64::new(now),
+                });
+                slot.insert(Arc::clone(&state));
+                Ok(state)
+            }
+        }
+    }
+
+    /// 清理长期不用的上游条目，让热重载换掉的上游不会一直占着连接池
+    /// Drop entries nothing has used for a while, so upstreams a reload replaced
+    /// do not keep their connection pools for the life of the process
+    ///
+    /// 每次查表之后都会调用，但受时间间隔节流：一次热重载换掉整批上游、之后再没有
+    /// 新上游出现时，旧条目同样会在下一个间隔被清掉，不必等下一次新键插入。
+    /// Called after every lookup but throttled by time: when a reload swaps the
+    /// whole set of upstreams and no new one ever appears again, the old entries
+    /// still go at the next interval instead of waiting for another new key.
+    fn prune_idle_upstreams(&self, now: u64) {
+        // 热路径上只剩一次 relaxed 读 / A single relaxed load on the hot path
+        let last_prune = self.last_prune_millis.load(Ordering::Relaxed);
+        let prune_every = u64::try_from(DOH_UPSTREAM_PRUNE_EVERY.as_millis()).unwrap_or(u64::MAX);
+        if now.saturating_sub(last_prune) < prune_every {
+            return;
+        }
+        if self.upstreams.len() <= DOH_UPSTREAM_PRUNE_AT {
+            return;
+        }
+        // 只让一个调用者真正执行这一轮 / Only one caller runs this round
+        if self
+            .last_prune_millis
+            .compare_exchange(last_prune, now, Ordering::AcqRel, Ordering::Relaxed)
+            .is_err()
+        {
+            return;
+        }
+        let idle_millis = u64::try_from(DOH_UPSTREAM_IDLE.as_millis()).unwrap_or(u64::MAX);
+        self.upstreams.retain(|_, state| {
+            now.saturating_sub(state.last_used_millis.load(Ordering::Relaxed)) < idle_millis
+        });
+    }
+
     pub async fn send(
         &self,
         packet: &[u8],
@@ -1309,11 +1485,12 @@ impl DohClient {
     ) -> anyhow::Result<Bytes> {
         let (url, host_override) = build_doh_url(upstream)?;
         let host = host_override.as_deref();
+        let state = self.upstream(upstream)?;
 
         let start = tokio::time::Instant::now();
-        match self.send_once(packet, &url, host, timeout_dur).await {
+        match Self::send_once(&state, packet, &url, host, timeout_dur).await {
             Ok(bytes) => {
-                self.record_success(upstream);
+                state.consecutive_errors.store(0, Ordering::Release);
                 Ok(bytes)
             }
             Err(err) if is_transport_error(&err) => {
@@ -1324,21 +1501,17 @@ impl DohClient {
                 // record_error() 可能先重建连接池，重试时加载新客户端（新连接）。
                 let rebuilt = self.record_error(upstream);
                 let remaining = timeout_dur.saturating_sub(start.elapsed());
-                // Mirror TcpMuxClient: guarantee >= 1.5s budget for the fresh attempt.
-                // 对齐 TcpMuxClient：为新尝试保证至少 1.5s 预算
-                let retry_timeout = if remaining < Duration::from_secs(1) {
-                    Duration::from_millis(1500)
-                } else {
-                    remaining
-                };
-                warn!(
+                if remaining < MIN_RETRY_BUDGET {
+                    return Err(err);
+                }
+                debug!(
                     upstream = upstream,
                     error = %err,
                     pool_rebuilt = rebuilt,
-                    retry_timeout_ms = retry_timeout.as_millis() as u64,
+                    retry_timeout_ms = remaining.as_millis() as u64,
                     "DoH transport error, performing transparent retry"
                 );
-                self.send_once(packet, &url, host, retry_timeout).await
+                Self::send_once(&state, packet, &url, host, remaining).await
             }
             Err(e) => Err(e),
         }
@@ -1347,7 +1520,7 @@ impl DohClient {
     /// Single attempt: send the request and read the body within a timeout.
     /// 单次尝试：在超时内发送请求并读取响应体
     async fn send_once(
-        &self,
+        state: &DohUpstream,
         packet: &[u8],
         url: &Url,
         host_override: Option<&str>,
@@ -1357,7 +1530,7 @@ impl DohClient {
         // await points (an ArcSwap Guard would not). The Arc is cheap to hold.
         // load_full() 返回 owned Arc<Client>，保持 Future 跨 await 点 Send
         // （ArcSwap 的 Guard 不满足）。持有 Arc 很廉价。
-        let client = self.client.load_full();
+        let client = state.client.load_full();
 
         let mut req = client
             .post(url.clone())
@@ -1402,30 +1575,33 @@ impl DohClient {
     }
 
     /// Record a consecutive transport error for the upstream. When the count
-    /// reaches the threshold, rebuild the reqwest client (evicting the dead
-    /// connection pool) and reset the counter. Returns true if rebuilt.
-    /// 记录 upstream 的连续传输错误。计数达阈值时重建 reqwest 客户端
-    /// （驱逐死连接池）并清零计数。重建返回 true。
+    /// reaches the threshold, rebuild that upstream's reqwest client (evicting
+    /// its dead connection pool) and reset the counter. Returns true if rebuilt.
+    /// 记录 upstream 的连续传输错误。计数达阈值时重建该上游的 reqwest 客户端
+    /// （驱逐其死连接池）并清零计数。重建返回 true。
     fn record_error(&self, upstream: &str) -> bool {
-        let mut count = self
-            .error_counts
-            .entry(Arc::<str>::from(upstream))
-            .or_insert(0);
-        *count += 1;
-        if *count >= self.health_error_threshold {
+        let state = match self.upstream(upstream) {
+            Ok(state) => state,
+            Err(e) => {
+                warn!(upstream = upstream, error = %e, "failed to build DoH client");
+                return false;
+            }
+        };
+        let count = state.consecutive_errors.fetch_add(1, Ordering::AcqRel) + 1;
+        if self.health_error_threshold > 0 && count >= self.health_error_threshold {
             match Self::build_client(self.pool_max_idle_per_host) {
                 Ok(new_client) => {
                     // Swap in a fresh client; the old pool is released once in-flight
                     // requests holding a cloned Arc finish.
                     // 替换为新客户端；旧池在持有 Arc 副本的在途请求结束后释放
-                    self.client.store(Arc::new(new_client));
+                    state.client.store(Arc::new(new_client));
                     warn!(
                         upstream = upstream,
-                        consecutive_errors = *count,
+                        consecutive_errors = count,
                         threshold = self.health_error_threshold,
                         "DoH error threshold exceeded, rebuilding connection pool"
                     );
-                    *count = 0;
+                    state.consecutive_errors.store(0, Ordering::Release);
                     true
                 }
                 Err(e) => {
@@ -1440,7 +1616,7 @@ impl DohClient {
         } else {
             debug!(
                 upstream = upstream,
-                consecutive_errors = *count,
+                consecutive_errors = count,
                 threshold = self.health_error_threshold,
                 "DoH transport error recorded"
             );
@@ -1448,11 +1624,12 @@ impl DohClient {
         }
     }
 
-    /// Clear the consecutive error counter on success (mirrors record_success).
-    /// 成功时清零连续错误计数（对齐 record_success）
+    /// Clear the consecutive error counter of `upstream` (what a successful
+    /// send does inline). / 清零 `upstream` 的连续错误计数（成功发送时内联完成）。
+    #[cfg(test)]
     fn record_success(&self, upstream: &str) {
-        if let Some(mut count) = self.error_counts.get_mut(upstream) {
-            *count = 0;
+        if let Some(state) = self.upstreams.get(upstream) {
+            state.consecutive_errors.store(0, Ordering::Release);
         }
     }
 }
@@ -1770,7 +1947,7 @@ impl DotMuxClient {
         let errors = self.consecutive_errors.fetch_add(1, Ordering::Release) + 1;
         let threshold = self.health_threshold.load(Ordering::Acquire);
 
-        if errors >= threshold {
+        if threshold > 0 && errors >= threshold {
             warn!(
                 upstream = %self.upstream,
                 consecutive_errors = errors,
@@ -1846,24 +2023,17 @@ impl DotMuxClient {
             Ok(res) => Ok(res),
             Err(err) => {
                 if is_reused {
-                    let elapsed = start.elapsed();
-                    let remaining = if timeout_dur > elapsed {
-                        timeout_dur - elapsed
-                    } else {
-                        Duration::from_millis(0)
-                    };
-                    let retry_timeout = if remaining.as_millis() < 1000 {
-                        Duration::from_millis(1500)
-                    } else {
-                        remaining
-                    };
-                    tracing::warn!(
+                    let remaining = timeout_dur.saturating_sub(start.elapsed());
+                    if remaining < MIN_RETRY_BUDGET {
+                        return Err(err);
+                    }
+                    debug!(
                         upstream = %self.upstream,
                         error = %err,
-                        retry_timeout_ms = retry_timeout.as_millis(),
+                        retry_timeout_ms = remaining.as_millis() as u64,
                         "DoT reuse failed, retrying with fresh connection"
                     );
-                    return self.send_attempt(packet, retry_timeout).await;
+                    return self.send_attempt(packet, remaining).await;
                 }
                 Err(err)
             }
@@ -1881,7 +2051,8 @@ impl DotMuxClient {
             self.last_health_check_time.store(now, Ordering::Relaxed);
         }
 
-        self.ensure_connection().await?;
+        self.ensure_connection(timeout_dur.saturating_sub(start.elapsed()))
+            .await?;
 
         let elapsed = start.elapsed();
         if elapsed >= timeout_dur {
@@ -1977,7 +2148,10 @@ impl DotMuxClient {
         Ok(resp)
     }
 
-    async fn ensure_connection(&self) -> anyhow::Result<()> {
+    /// `budget` bounds the TCP connect and the TLS handshake together; on
+    /// failure the lock and the permit are released immediately.
+    /// `budget` 同时约束 TCP 建连和 TLS 握手；失败时立即释放锁和 permit。
+    async fn ensure_connection(&self, budget: Duration) -> anyhow::Result<()> {
         let errors = self.consecutive_errors.load(Ordering::Acquire);
         let needs_reset = errors > 0;
 
@@ -2008,24 +2182,39 @@ impl DotMuxClient {
                     .clone()
             };
 
-            let stream = TcpStream::connect(&*target.connect_addr)
-                .await
-                .map_err(|e| anyhow::anyhow!("dot connect failed: {}", e))?;
-
-            let _ = stream.set_nodelay(true);
-            let sock = SockRef::from(&stream);
-            let mut ka = TcpKeepalive::new();
-            ka = ka.with_time(Duration::from_secs(5));
-            ka = ka.with_interval(Duration::from_secs(2));
-            let _ = sock.set_keepalive(true);
-            let _ = sock.set_tcp_keepalive(&ka);
-
+            // Connect and complete the TLS handshake within the budget: an
+            // upstream that accepts and stays silent would otherwise hold the
+            // lock, and every request queued behind it, indefinitely.
+            // 在预算内建连并完成 TLS 握手：accept 后沉默的上游否则会无限期占住锁，
+            // 排在后面的请求一起被钉死。
             let tls_connector = TlsConnector::from(self.tls_config.clone());
             let server_name = build_server_name(&target.sni)?;
-            let tls_stream = tls_connector
-                .connect(server_name, stream)
-                .await
-                .context("dot tls handshake failed")?;
+            let connect = async {
+                let stream = TcpStream::connect(&*target.connect_addr)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("dot connect failed: {}", e))?;
+
+                let _ = stream.set_nodelay(true);
+                let sock = SockRef::from(&stream);
+                let mut ka = TcpKeepalive::new();
+                ka = ka.with_time(Duration::from_secs(5));
+                ka = ka.with_interval(Duration::from_secs(2));
+                let _ = sock.set_keepalive(true);
+                let _ = sock.set_tcp_keepalive(&ka);
+
+                tls_connector
+                    .connect(server_name, stream)
+                    .await
+                    .context("dot tls handshake failed")
+            };
+            let tls_stream = match timeout(budget, connect).await {
+                Ok(Ok(stream)) => stream,
+                Ok(Err(e)) => return Err(e),
+                Err(_) => anyhow::bail!(
+                    "dot connect/handshake timeout after {}ms",
+                    budget.as_millis()
+                ),
+            };
 
             let (read_half, write_half) = tokio::io::split(tls_stream);
             *guard = Some(write_half);
@@ -2423,7 +2612,7 @@ impl DoqMuxClient {
     async fn record_error(&self) -> bool {
         let errors = self.consecutive_errors.fetch_add(1, Ordering::Release) + 1;
         let threshold = self.health_threshold.load(Ordering::Acquire);
-        if errors >= threshold {
+        if threshold > 0 && errors >= threshold {
             warn!(
                 upstream = %self.upstream,
                 consecutive_errors = errors,
@@ -3116,6 +3305,266 @@ mod tests {
         );
     }
 
+    /// Listener whose accept queue is full and never drained: the kernel drops
+    /// further SYNs, so a connect() to it hangs until the SYN retransmits give
+    /// up (minutes) unless the caller bounds it.
+    /// accept 队列已满且从不 accept 的监听器：内核丢弃后续 SYN，connect() 会挂到
+    /// SYN 重传耗尽（分钟级），除非调用方自己设限。
+    struct BlackholedListener {
+        addr: SocketAddr,
+        _listener: Socket,
+        _queued: Vec<std::net::TcpStream>,
+    }
+
+    async fn blackholed_tcp_listener() -> BlackholedListener {
+        let listener = Socket::new(Domain::IPV4, Type::STREAM, None).expect("create listener");
+        listener
+            .bind(&"127.0.0.1:0".parse::<SocketAddr>().unwrap().into())
+            .expect("bind listener");
+        listener.listen(1).expect("listen with backlog 1");
+        let addr = listener.local_addr().unwrap().as_socket().unwrap();
+        let queued = tokio::task::spawn_blocking(move || {
+            let mut held = Vec::new();
+            for _ in 0..8 {
+                if let Ok(stream) =
+                    std::net::TcpStream::connect_timeout(&addr, Duration::from_millis(200))
+                {
+                    held.push(stream);
+                }
+            }
+            held
+        })
+        .await
+        .expect("fill accept queue");
+        BlackholedListener {
+            addr,
+            _listener: listener,
+            _queued: queued,
+        }
+    }
+
+    /// Listener that accepts and then never sends a byte, so a TLS handshake
+    /// against it never completes.
+    /// accept 后一个字节都不发的监听器：TLS 握手永远完不成。
+    async fn silent_tcp_listener() -> SocketAddr {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind silent listener");
+        let addr = listener.local_addr().expect("read silent listener address");
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((stream, _)) = listener.accept().await {
+                held.push(stream);
+            }
+        });
+        addr
+    }
+
+    #[tokio::test]
+    async fn tcp_connect_is_bounded_by_the_request_budget() {
+        // ensure_connection used to call TcpStream::connect with no timeout while
+        // holding the connection lock: a blackholed upstream pinned the request
+        // (and every request queued behind the lock) for the kernel's SYN
+        // timeout, regardless of the configured upstream timeout.
+        // ensure_connection 曾在持有连接锁时无超时地 connect：上游黑洞时请求（以及排在
+        // 锁后的所有请求）会等满内核 SYN 超时，配置的 upstream 超时形同虚设。
+        let blackhole = blackholed_tcp_listener().await;
+        let client = TcpMuxClient::new(
+            Arc::from(blackhole.addr.to_string()),
+            Arc::new(PermitManager::new(1)),
+        );
+        let started = tokio::time::Instant::now();
+        let result = timeout(
+            Duration::from_secs(3),
+            client.send(&[0u8; 12], Duration::from_millis(300)),
+        )
+        .await
+        .expect("send must give up within its budget, not wait for the kernel SYN timeout");
+        assert!(result.is_err(), "a blackholed upstream cannot succeed");
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "gave up after {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[tokio::test]
+    async fn dot_connect_and_handshake_are_bounded_by_the_request_budget() {
+        // Same for DoT, where the TLS handshake is the part that can stall: an
+        // upstream that accepts and stays silent must not pin the request.
+        // DoT 同理，卡住的是 TLS 握手：accept 后沉默的上游不能钉死请求。
+        let addr = silent_tcp_listener().await;
+        let client = DotMuxClient::new(
+            Arc::from(format!("dot://{addr}?sni=localhost")),
+            Arc::new(build_tls_client_config().expect("tls config")),
+            Arc::new(PermitManager::new(1)),
+        );
+        let started = tokio::time::Instant::now();
+        let result = timeout(
+            Duration::from_secs(3),
+            client.send(&[0u8; 12], Duration::from_millis(300)),
+        )
+        .await
+        .expect("send must give up within its budget, not wait for a handshake that never comes");
+        assert!(result.is_err(), "a silent upstream cannot succeed");
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "gave up after {:?}",
+            started.elapsed()
+        );
+    }
+
+    /// TCP upstream that answers the very first query it ever receives
+    /// (echoing the frame with QR set) and then swallows everything, on that
+    /// connection and on any later one.
+    /// 只应答收到的第一个查询（回显帧并置 QR 位），之后无论旧连接还是新连接一律吞掉的
+    /// TCP 上游。
+    async fn answer_once_then_stall_tcp_upstream() -> SocketAddr {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind stalling upstream");
+        let addr = listener
+            .local_addr()
+            .expect("read stalling upstream address");
+        let answered = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let answered = Arc::clone(&answered);
+                tokio::spawn(async move {
+                    let mut len = [0u8; 2];
+                    if stream.read_exact(&mut len).await.is_err() {
+                        return;
+                    }
+                    let mut frame = vec![0u8; u16::from_be_bytes(len) as usize];
+                    if stream.read_exact(&mut frame).await.is_err() {
+                        return;
+                    }
+                    if !answered.swap(true, Ordering::SeqCst) {
+                        frame[2] |= 0x80;
+                        let _ = stream.write_all(&len).await;
+                        let _ = stream.write_all(&frame).await;
+                    }
+                    let mut sink = [0u8; 512];
+                    while stream.read(&mut sink).await.is_ok_and(|n| n > 0) {}
+                });
+            }
+        });
+        addr
+    }
+
+    #[tokio::test]
+    async fn tcp_retry_does_not_exceed_the_request_budget() {
+        // The transparent retry over a fresh connection used to be granted a
+        // 1.5 s floor even when the caller's budget was already spent, so a
+        // 200 ms request took about 1.7 s on a stalled reused connection.
+        // 复用连接失败后的透明重试曾无条件给 1.5 s 保底：预算 200 ms 的请求在卡住的
+        // 复用连接上要跑约 1.7 s。
+        let addr = answer_once_then_stall_tcp_upstream().await;
+        let client =
+            TcpMuxClient::new(Arc::from(addr.to_string()), Arc::new(PermitManager::new(1)));
+        let query = [0x12, 0x34, 0x01, 0x00, 0, 0, 0, 0, 0, 0, 0, 0];
+        client
+            .send(&query, Duration::from_millis(500))
+            .await
+            .expect("first query on a fresh connection is answered");
+
+        let started = tokio::time::Instant::now();
+        let err = client
+            .send(&query, Duration::from_millis(200))
+            .await
+            .expect_err("stalled upstream cannot answer the second query");
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < Duration::from_millis(700),
+            "second query took {elapsed:?} on a 200 ms budget: {err:#}"
+        );
+    }
+
+    /// UDP upstream on `bind` that echoes every query back with QR set, or
+    /// `None` when the address family is unavailable on this host.
+    /// 绑定在 `bind` 上、把每个查询置 QR 位后原样回显的 UDP 上游；该地址族不可用时为 None。
+    async fn spawn_udp_echo_upstream(bind: &str) -> Option<String> {
+        let socket = tokio::net::UdpSocket::bind(bind).await.ok()?;
+        let addr = socket.local_addr().expect("read UDP echo address");
+        tokio::spawn(async move {
+            let mut buf = [0u8; 512];
+            while let Ok((n, src)) = socket.recv_from(&mut buf).await {
+                buf[2] |= 0x80;
+                let _ = socket.send_to(&buf[..n], src).await;
+            }
+        });
+        Some(addr.to_string())
+    }
+
+    /// v6 池此前无条件预建：默认 udp_pool_size=64 时，哪怕一个 IPv6 上游都没有
+    /// 也要多占 64 个 socket 和 64 个任务。
+    /// The v6 pool used to be built unconditionally: with the default
+    /// udp_pool_size of 64 a deployment without a single IPv6 upstream still
+    /// paid for 64 sockets and 64 tasks.
+    #[tokio::test]
+    async fn udp_ipv6_pool_is_built_only_when_an_ipv6_upstream_is_used() {
+        let client = UdpClient::new(4).expect("create UDP client");
+        assert!(
+            client.pool_v6.get().is_none(),
+            "no IPv6 socket may be created before an IPv6 upstream is used"
+        );
+
+        let upstream_v4 = spawn_udp_echo_upstream("127.0.0.1:0")
+            .await
+            .expect("IPv4 loopback");
+        let query = [0x12, 0x34, 0x01, 0x00, 0, 0, 0, 0, 0, 0, 0, 0];
+        client
+            .send(&query, &upstream_v4, Duration::from_secs(2))
+            .await
+            .expect("IPv4 upstream reachable");
+        assert!(
+            client.pool_v6.get().is_none(),
+            "IPv4 traffic must not build the IPv6 pool"
+        );
+
+        let Some(upstream_v6) = spawn_udp_echo_upstream("[::1]:0").await else {
+            eprintln!("IPv6 loopback unavailable, skipping the second half");
+            return;
+        };
+        client
+            .send(&query, &upstream_v6, Duration::from_secs(2))
+            .await
+            .expect("IPv6 upstream reachable");
+        assert!(
+            client.pool_v6.get().is_some(),
+            "the IPv6 pool must appear once an IPv6 upstream is used"
+        );
+    }
+
+    #[tokio::test]
+    async fn udp_send_reaches_an_ipv6_upstream() {
+        // The pool only ever created AF_INET sockets, so an IPv6 UDP upstream
+        // failed every send with "address family not supported" and the query
+        // ended in SERVFAIL while the same host over TCP worked.
+        // 连接池只建 AF_INET socket：IPv6 UDP 上游每次发送都失败，查询以 SERVFAIL 告终，
+        // 而同一主机走 TCP 正常。
+        let Some(upstream) = spawn_udp_echo_upstream("[::1]:0").await else {
+            eprintln!("IPv6 loopback unavailable, skipping");
+            return;
+        };
+        let client = UdpClient::new(1).expect("create UDP client");
+        let query = [0x12, 0x34, 0x01, 0x00, 0, 0, 0, 0, 0, 0, 0, 0];
+        let response = client
+            .send(&query, &upstream, Duration::from_secs(2))
+            .await
+            .expect("IPv6 UDP upstream must be reachable");
+        assert_eq!(&response[..2], &query[..2], "original ID restored");
+
+        // IPv4 keeps working through the same client.
+        let upstream_v4 = spawn_udp_echo_upstream("127.0.0.1:0")
+            .await
+            .expect("IPv4 loopback");
+        client
+            .send(&query, &upstream_v4, Duration::from_secs(2))
+            .await
+            .expect("IPv4 UDP upstream still reachable");
+    }
+
     async fn connected_tcp_write_half() -> (OwnedWriteHalf, TcpStream) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
@@ -3187,6 +3636,113 @@ mod tests {
         assert!(parse_doq_target("doq://dns.alidns.com:853").is_ok());
     }
 
+    /// README 与 config.rs 都写明阈值 0 表示禁用健康检查，而 `count >= threshold`
+    /// 会让 0 变成"每次错误都重建连接池"，正好相反。
+    /// README and config.rs both state that a threshold of 0 disables the health
+    /// check, while `count >= threshold` turns 0 into a rebuild on every single
+    /// error, the exact opposite.
+    #[test]
+    fn doh_record_error_treats_a_zero_threshold_as_disabled() {
+        let client = DohClient::new(8, 0).expect("build doh client");
+        let upstream = "doh:8.8.8.8";
+        let ptr_before =
+            Arc::as_ptr(&client.upstream(upstream).unwrap().client.load_full()) as usize;
+
+        for attempt in 1..=5 {
+            assert!(
+                !client.record_error(upstream),
+                "a disabled health check must never rebuild (error {attempt})"
+            );
+        }
+        assert_eq!(
+            Arc::as_ptr(&client.upstream(upstream).unwrap().client.load_full()) as usize,
+            ptr_before,
+            "the connection pool must survive a disabled health check"
+        );
+    }
+
+    /// 热重载换掉的上游此前会一直留着自己的连接池；超过清理阈值后，
+    /// 长期不用的条目会被清掉。
+    /// Upstreams a reload replaced used to keep their connection pools forever;
+    /// past the prune threshold, entries nothing has used are dropped.
+    #[test]
+    fn doh_prunes_upstreams_nothing_has_used() {
+        let client = DohClient::new(8, 3).expect("build doh client");
+        for idx in 0..=DOH_UPSTREAM_PRUNE_AT {
+            client
+                .upstream(&format!("https://{idx}.example/dns-query"))
+                .expect("create upstream");
+        }
+        let live = "https://live.example/dns-query";
+        client.upstream(live).expect("create live upstream");
+        age_out_idle_upstreams(&client, live);
+
+        client
+            .upstream("https://new.example/dns-query")
+            .expect("create upstream");
+
+        assert!(
+            client.upstreams.len() <= 2,
+            "idle upstreams must be pruned, {} left",
+            client.upstreams.len()
+        );
+        assert!(
+            client.upstreams.contains_key(live),
+            "an upstream in use must never be pruned"
+        );
+    }
+
+    /// 热重载换掉整批上游之后可能再没有新上游出现，此前清理只挂在新键插入上，
+    /// 旧条目会留到进程结束；现在查一次已有上游也会触发清理。
+    /// A reload can swap the whole upstream set and no new upstream ever follows;
+    /// pruning used to hang off new-key inserts alone, so the old entries lived
+    /// until the process exited. A lookup of an existing upstream now prunes too.
+    #[test]
+    fn doh_prunes_idle_upstreams_without_new_keys() {
+        let client = DohClient::new(8, 3).expect("build doh client");
+        for idx in 0..=DOH_UPSTREAM_PRUNE_AT {
+            client
+                .upstream(&format!("https://{idx}.example/dns-query"))
+                .expect("create upstream");
+        }
+        let live = "https://live.example/dns-query";
+        client.upstream(live).expect("create live upstream");
+        age_out_idle_upstreams(&client, live);
+
+        // 只重复查询已有上游，不插入任何新键
+        // Only look the existing upstream up again; no new key is inserted
+        client.upstream(live).expect("look up live upstream");
+
+        assert!(
+            client.upstreams.len() <= 2,
+            "idle upstreams must be pruned without a new key, {} left",
+            client.upstreams.len()
+        );
+        assert!(
+            client.upstreams.contains_key(live),
+            "an upstream in use must never be pruned"
+        );
+    }
+
+    /// 把除 `live` 之外的条目标记为长期未使用，并让节流窗口过期
+    /// Age every entry except `live`, and let the prune interval lapse
+    fn age_out_idle_upstreams(client: &DohClient, live: &str) {
+        let now = unix_time_millis();
+        let stale = now.saturating_sub(DOH_UPSTREAM_IDLE.as_millis() as u64 * 2);
+        for entry in client.upstreams.iter() {
+            if entry.key().as_ref() != live {
+                entry
+                    .value()
+                    .last_used_millis
+                    .store(stale, Ordering::Relaxed);
+            }
+        }
+        client.last_prune_millis.store(
+            now.saturating_sub(DOH_UPSTREAM_PRUNE_EVERY.as_millis() as u64 * 2),
+            Ordering::Relaxed,
+        );
+    }
+
     #[test]
     fn doh_record_error_rebuilds_pool_at_threshold() {
         // Verify the core self-healing contract: consecutive transport errors below
@@ -3199,7 +3755,8 @@ mod tests {
         let client = DohClient::new(8, 3).expect("build doh client");
         let upstream = "doh:8.8.8.8";
 
-        let ptr_before = Arc::as_ptr(&client.client.load_full()) as usize;
+        let ptr_before =
+            Arc::as_ptr(&client.upstream(upstream).unwrap().client.load_full()) as usize;
         // Two errors stay below the threshold (3): no rebuild.
         assert!(
             !client.record_error(upstream),
@@ -3210,16 +3767,50 @@ mod tests {
             "no rebuild before threshold (2/3)"
         );
         assert_eq!(
-            Arc::as_ptr(&client.client.load_full()) as usize,
+            Arc::as_ptr(&client.upstream(upstream).unwrap().client.load_full()) as usize,
             ptr_before,
             "client pointer must be unchanged below threshold"
         );
         // Third error reaches the threshold: pool rebuilt.
         assert!(client.record_error(upstream), "rebuild at threshold (3/3)");
         assert_ne!(
-            Arc::as_ptr(&client.client.load_full()) as usize,
+            Arc::as_ptr(&client.upstream(upstream).unwrap().client.load_full()) as usize,
             ptr_before,
             "client pointer must change after rebuild"
+        );
+    }
+
+    #[test]
+    fn doh_rebuild_is_scoped_to_the_failing_upstream() {
+        // A single reqwest client used to be shared by every DoH upstream, so
+        // reaching the error threshold on one upstream replaced the pool of all
+        // of them: the healthy upstream lost its keep-alive connections and had
+        // to handshake again. Each upstream now owns its client.
+        // 以前所有 DoH 上游共用一个 reqwest 客户端，一个上游达到错误阈值会把所有
+        // 上游的连接池一起换掉，健康上游丢失 keep-alive 连接、被迫重新握手。
+        // 现在每个上游各持一个客户端。
+        let client = DohClient::new(8, 3).expect("build doh client");
+        let healthy = "doh:1.1.1.1";
+        let failing = "doh:bad.example";
+        let healthy_before =
+            Arc::as_ptr(&client.upstream(healthy).unwrap().client.load_full()) as usize;
+        let failing_before =
+            Arc::as_ptr(&client.upstream(failing).unwrap().client.load_full()) as usize;
+
+        for _ in 0..2 {
+            assert!(!client.record_error(failing));
+        }
+        assert!(client.record_error(failing), "third error rebuilds");
+
+        assert_ne!(
+            Arc::as_ptr(&client.upstream(failing).unwrap().client.load_full()) as usize,
+            failing_before,
+            "the failing upstream's pool is rebuilt"
+        );
+        assert_eq!(
+            Arc::as_ptr(&client.upstream(healthy).unwrap().client.load_full()) as usize,
+            healthy_before,
+            "the healthy upstream keeps its pool"
         );
     }
 
