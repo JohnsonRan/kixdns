@@ -80,16 +80,6 @@ pub struct Engine {
     pub metrics_last_upstream_latency_ns: Arc<AtomicU64>,
     // Adaptive flow control state (None when flow control is disabled) / 自适应流控状态（禁用流控时为None）
     pub flow_control_state: Option<Arc<FlowControlState>>,
-    // Cache background refresh settings / 缓存后台刷新设置
-    pub(crate) cache_background_refresh: bool,
-    pub(crate) cache_refresh_threshold_percent: u8,
-    pub(crate) cache_refresh_min_ttl: u32,
-    // RFC 8767: Serve stale cache on upstream failure / RFC 8767: 上游失败时提供过期缓存
-    pub(crate) serve_stale: bool,
-    pub(crate) serve_stale_ttl: u32,
-    pub(crate) serve_stale_expire_ttl: u64,
-    pub(crate) serve_stale_ttl_reset: bool,
-    pub(crate) serve_stale_client_timeout_ms: u64,
     // GeoIP manager for geographic IP-based routing / GeoIP 管理器用于基于地理位置的 IP 路由
     pub geoip_manager: Arc<RwLock<GeoIpManager>>,
     // GeoSite manager for domain category-based routing / GeoSite 管理器用于域名分类路由
@@ -202,14 +192,6 @@ impl Engine {
         let flow_control_adjustment_interval_secs =
             cfg.settings.flow_control_adjustment_interval_secs;
         let dashmap_shards = cfg.settings.dashmap_shards;
-        let cache_background_refresh = cfg.settings.cache_background_refresh;
-        let cache_refresh_threshold_percent = cfg.settings.cache_refresh_threshold_percent;
-        let cache_refresh_min_ttl = cfg.settings.cache_refresh_min_ttl;
-        let serve_stale = cfg.settings.serve_stale;
-        let serve_stale_ttl = cfg.settings.serve_stale_ttl;
-        let serve_stale_expire_ttl = cfg.settings.serve_stale_expire_ttl;
-        let serve_stale_ttl_reset = cfg.settings.serve_stale_ttl_reset;
-        let serve_stale_client_timeout_ms = cfg.settings.serve_stale_client_timeout_ms;
 
         // Extract TCP health check settings / 提取 TCP 健康检查配置
         let tcp_health_error_threshold = cfg.settings.tcp_health_check_error_threshold;
@@ -320,14 +302,18 @@ impl Engine {
 
                 let load_result = if is_dat {
                     // 使用按需加载 / Use selective loading
-                    // parking_lot::RwLock::write() 返回 guard 直接，不会中毒
-                    let mut manager = geosite_manager.write();
                     if used_geosite_tags.is_empty() {
                         // 没有使用 GeoSite 标签，跳过加载 / No GeoSite tags used, skip loading
                         info!("No GeoSite tags used in config, skipping GeoSite data loading");
                         Ok(0)
                     } else {
-                        manager.load_from_dat_file_selective(&path, &used_geosite_tags)
+                        // 在锁外解析，只在替换数据时持写锁
+                        // Parse outside the lock, hold the write lock only for the swap
+                        crate::matcher::geosite::GeoSiteManager::parse_dat_file_selective(
+                            &path,
+                            &used_geosite_tags,
+                        )
+                        .map(|parsed| geosite_manager.write().apply_source(&path, parsed))
                     }
                 } else {
                     // JSON 格式：全量加载 / JSON format: load all
@@ -341,12 +327,17 @@ impl Engine {
                         info!(path = %path.display(), loaded_count = count,
                              used_tags = used_geosite_tags.len(),
                              "loaded GeoSite data from file");
-                        geosite_paths_for_watcher.push(path);
                     }
                     Err(e) => {
-                        warn!(path = %path.display(), error = %e, "failed to load GeoSite data, skipping");
+                        warn!(path = %path.display(), error = %e, "failed to load GeoSite data, waiting for the file to change");
                     }
                 }
+                // 解析失败也交给 watcher：写了一半或被截断的文件在下次写入完成时
+                // 能自己恢复，不必重启进程。
+                // Register with the watcher even when the parse failed: a
+                // half-written or truncated file heals itself on the next write
+                // instead of needing a restart.
+                geosite_paths_for_watcher.push(path);
             } else {
                 warn!(path = %path.display(), "GeoSite data file not found, skipping");
             }
@@ -469,15 +460,9 @@ impl Engine {
             permit_manager,
             flow_control_state,
             // Cache background refresh settings / 缓存后台刷新设置
-            cache_background_refresh,
-            cache_refresh_threshold_percent,
-            cache_refresh_min_ttl,
+
             // RFC 8767: Serve stale cache settings / RFC 8767: 过期缓存设置
-            serve_stale,
-            serve_stale_ttl,
-            serve_stale_expire_ttl,
-            serve_stale_ttl_reset,
-            serve_stale_client_timeout_ms,
+
             // GeoIP manager / GeoIP 管理器
             geoip_manager,
             // GeoSite manager / GeoSite 管理器

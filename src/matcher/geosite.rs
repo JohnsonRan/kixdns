@@ -96,7 +96,14 @@ pub struct GeoSiteManager {
     suffix_index: FxHashMap<String, Vec<String>>,
     // Query cache: hash(tag, domain) -> bool (零分配优化 / zero-allocation optimization)
     cache: MokaCache<u64, bool>,
+    // 每个数据文件贡献的 tag，重载时据此只替换该文件的条目
+    // Tags contributed by each data file, so a reload replaces only that file's entries
+    sources: FxHashMap<PathBuf, Vec<String>>,
 }
+
+/// 一个数据文件解析出的 tag 与域名匹配器，尚未进入管理器
+/// Tags and matchers parsed out of one data file, not yet applied to a manager
+pub type ParsedGeoSite = Vec<(String, Vec<DomainMatcher>)>;
 
 impl Default for GeoSiteManager {
     fn default() -> Self {
@@ -112,6 +119,7 @@ impl GeoSiteManager {
             database: FxHashMap::default(),
             suffix_index: FxHashMap::default(),
             cache: MokaCache::builder().max_capacity(1000).build(),
+            sources: FxHashMap::default(),
         }
     }
 
@@ -253,6 +261,7 @@ impl GeoSiteManager {
     pub fn reload(&mut self, entries: Vec<GeoSiteEntry>) {
         self.database.clear();
         self.suffix_index.clear();
+        self.sources.clear();
         self.cache.invalidate_all();
 
         for entry in entries {
@@ -477,6 +486,19 @@ impl GeoSiteManager {
     /// 如果文件不存在或格式错误，返回错误 / Returns error if file doesn't exist or format is invalid
     pub fn load_from_dat_file<P: AsRef<Path>>(&mut self, path: P) -> anyhow::Result<usize> {
         let path = path.as_ref();
+        let parsed = Self::parse_dat_file(path)?;
+        Ok(self.apply_source(path, parsed))
+    }
+
+    /// 解析 .dat 文件，不触碰管理器状态 / Parse a .dat file without touching manager state
+    ///
+    /// 与 [`Self::apply_source`] 配合使用：调用方可以在锁外解析，只在替换数据时
+    /// 短暂持有写锁；解析失败时管理器保持原样。
+    /// Pairs with [`Self::apply_source`]: callers parse outside the lock and hold
+    /// the write lock only while swapping data in, and a failed parse leaves the
+    /// manager untouched.
+    pub fn parse_dat_file<P: AsRef<Path>>(path: P) -> anyhow::Result<ParsedGeoSite> {
+        let path = path.as_ref();
 
         // 读取文件内容 / Read file content
         let content =
@@ -492,7 +514,7 @@ impl GeoSiteManager {
         //       - value (string, field tag 0x12)
 
         let mut pos = 0;
-        let mut loaded_count = 0;
+        let mut parsed: ParsedGeoSite = Vec::new();
 
         while pos < content.len() {
             // 读取外层字段标签 / Read outer field tag
@@ -506,9 +528,17 @@ impl GeoSiteManager {
             // 解析 varint 长度 / Parse varint length
             let entry_len = parse_varint(&content, &mut pos)?;
 
-            // 检查是否有足够的数据 / Check if we have enough data
+            // 文件被截断（写入中断或读到写了一半的覆盖）：拒绝整份文件，
+            // 否则调用方会把读到的那部分当成完整版本，文件里其余的 tag 就被删掉了。
+            // A truncated file (an interrupted write, or a half-written overwrite
+            // caught in the act) is rejected outright: otherwise the caller takes
+            // the part that was read as the complete file and drops every tag the
+            // rest of it holds.
             if pos + entry_len > content.len() {
-                break;
+                anyhow::bail!(
+                    "truncated .dat file: entry at offset {pos} needs {entry_len} bytes, {} left",
+                    content.len() - pos
+                );
             }
 
             let entry_end = pos + entry_len;
@@ -547,7 +577,7 @@ impl GeoSiteManager {
                             // 每个 Domain 消息包含: type (field 1) 和 value (field 2)
                             // Each Domain message contains: type (field 1) and value (field 2)
                             let domains_data = &content[pos..pos + inner_len];
-                            match self.parse_v2ray_domains(domains_data) {
+                            match Self::parse_v2ray_domains(domains_data) {
                                 Ok(parsed) => {
                                     let count = parsed.len();
                                     matchers.extend(parsed.into_iter().map(|(m, _)| m));
@@ -578,8 +608,7 @@ impl GeoSiteManager {
                     let tag_lower = tag.to_lowercase();
                     tracing::debug!(target = "geosite", original_tag = %tag, tag_lower = %tag_lower,
                                  "inserting tag into database");
-                    self.database.insert(tag_lower, matchers);
-                    loaded_count += 1;
+                    parsed.push((tag_lower, matchers));
                 } else if !tag.is_empty() {
                     tracing::warn!(target = "geosite", tag = %tag,
                                   "tag has no valid domains, skipping");
@@ -591,14 +620,112 @@ impl GeoSiteManager {
         }
 
         // 根据实际加载的条数重建缓存
-        self.rebuild_cache();
-
         info!(
             target = "geosite",
-            loaded_count = loaded_count,
+            loaded_count = parsed.len(),
             "loaded GeoSite data from V2Ray .dat file"
         );
-        Ok(loaded_count)
+        Ok(parsed)
+    }
+
+    /// 用一个数据文件的解析结果替换该文件此前贡献的 tag
+    /// Replace the tags a data file contributed with its freshly parsed content
+    ///
+    /// 文件里删掉的 tag 随之消失，其它文件贡献的 tag 保持不变
+    /// （`geosite_data_paths` 接受多个文件），查询缓存一并重建。
+    /// Tags dropped from the file disappear with it while tags from other files
+    /// stay (`geosite_data_paths` accepts several files); the query cache is
+    /// rebuilt along the way.
+    pub fn apply_source<P: AsRef<Path>>(&mut self, path: P, parsed: ParsedGeoSite) -> usize {
+        let key = Self::source_key(path.as_ref());
+        let previous = self.sources.remove(&key).unwrap_or_default();
+
+        let mut tags = Vec::with_capacity(parsed.len());
+        for (tag, matchers) in parsed {
+            self.database.insert(tag.clone(), matchers);
+            tags.push(tag);
+        }
+
+        // 这个文件不再提供的 tag：没有别的文件提供就删掉；还有别的文件提供，
+        // 就从那个文件里重新读出来顶上——否则索引里留着的仍是本文件的旧条目，
+        // 名义上 tag 还在，命中的却是已经被删掉的数据。多个文件声明同一个 tag
+        // 时最后加载的一份生效（与全量加载一致）。
+        // For tags this file no longer provides: drop them when no other file
+        // provides them, and re-read them from a file that still does otherwise.
+        // Without that the index keeps this file's own stale entries, so the tag
+        // survives but matches data that was deleted. When several files declare
+        // the same tag the last load wins, as with a full load.
+        for tag in previous {
+            if tags.contains(&tag) {
+                continue;
+            }
+            match self.other_source_providing(&key, &tag) {
+                Some(other) => self.reload_tag_from(&other, &tag),
+                None => {
+                    self.database.remove(&tag);
+                }
+            }
+        }
+
+        let loaded_count = tags.len();
+        self.sources.insert(key, tags);
+
+        self.rebuild_cache();
+        loaded_count
+    }
+
+    /// 找一个仍在提供这个 tag 的其它数据文件；多个候选时取路径最小的一个，
+    /// 让结果与哈希表的遍历顺序无关。
+    /// Find another data file still providing this tag; with several candidates
+    /// the smallest path wins, so the result does not depend on hash order.
+    fn other_source_providing(&self, skip: &Path, tag: &str) -> Option<PathBuf> {
+        self.sources
+            .iter()
+            .filter(|(path, provided)| {
+                path.as_path() != skip && provided.iter().any(|name| name == tag)
+            })
+            .map(|(path, _)| path.clone())
+            .min()
+    }
+
+    /// 从另一个数据文件里重新读出单个 tag；读不出来就保持原样，等那个文件自己
+    /// 重载时纠正，总好过留下一个空 tag。
+    /// Re-read a single tag from another data file; leave the index as it is when
+    /// that fails and let the other file's own reload fix it, which beats leaving
+    /// the tag empty.
+    fn reload_tag_from(&mut self, path: &Path, tag: &str) {
+        let wanted = [tag.to_string()];
+        match Self::parse_dat_file_selective(path, &wanted) {
+            Ok(parsed) => {
+                if let Some((_, matchers)) = parsed.into_iter().find(|(name, _)| name == tag) {
+                    self.database.insert(tag.to_string(), matchers);
+                    return;
+                }
+                warn!(
+                    target = "geosite",
+                    path = %path.display(), tag,
+                    "data file no longer contains a tag it was recorded as providing"
+                );
+            }
+            Err(e) => {
+                warn!(
+                    target = "geosite",
+                    path = %path.display(), tag, error = %e,
+                    "failed to re-read a shared tag, keeping the current entries"
+                );
+            }
+        }
+    }
+
+    /// 数据文件的身份：尽量用规范化后的绝对路径，这样配置里写的相对路径与
+    /// 监视器事件带来的绝对路径指向同一条记录；无法规范化（文件刚被删掉等）时
+    /// 退回原路径。
+    /// Identity of a data file: the canonical absolute path where possible, so a
+    /// relative path from the configuration and the absolute path a watcher
+    /// event carries refer to the same entry; falls back to the path as given
+    /// when it cannot be canonicalised (the file was just removed, say).
+    fn source_key(path: &Path) -> PathBuf {
+        std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
     }
 
     /// 解析 varint / Parse varint
@@ -640,8 +767,22 @@ impl GeoSiteManager {
         path: P,
         tags: &[String],
     ) -> anyhow::Result<usize> {
+        let path = path.as_ref();
+        let parsed = Self::parse_dat_file_selective(path, tags)?;
+        Ok(self.apply_source(path, parsed))
+    }
+
+    /// 按需解析 .dat 文件，不触碰管理器状态
+    /// Parse the requested tags out of a .dat file without touching manager state
+    ///
+    /// 与 [`Self::apply_source`] 配合使用，见 [`Self::parse_dat_file`]。
+    /// Pairs with [`Self::apply_source`], see [`Self::parse_dat_file`].
+    pub fn parse_dat_file_selective<P: AsRef<Path>>(
+        path: P,
+        tags: &[String],
+    ) -> anyhow::Result<ParsedGeoSite> {
         if tags.is_empty() {
-            return Ok(0);
+            return Ok(Vec::new());
         }
 
         // Pre-process tags: split `tag@attr` syntax into (base, attr_filter)
@@ -664,7 +805,7 @@ impl GeoSiteManager {
             .with_context(|| format!("read .dat file: {}", path.as_ref().display()))?;
 
         let mut pos = 0;
-        let mut loaded_count = 0;
+        let mut parsed: ParsedGeoSite = Vec::new();
 
         while pos < content.len() {
             if pos >= content.len() {
@@ -676,8 +817,13 @@ impl GeoSiteManager {
 
             let entry_len = parse_varint(&content, &mut pos)?;
 
+            // 截断的文件同样整份拒绝，理由见 parse_dat_file
+            // A truncated file is rejected here too, see parse_dat_file
             if pos + entry_len > content.len() {
-                break;
+                anyhow::bail!(
+                    "truncated .dat file: entry at offset {pos} needs {entry_len} bytes, {} left",
+                    content.len() - pos
+                );
             }
 
             let entry_end = pos + entry_len;
@@ -737,7 +883,7 @@ impl GeoSiteManager {
                             }
                             0x12 => {
                                 let domains_data = &content[pos..pos + inner_len];
-                                match self.parse_v2ray_domains(domains_data) {
+                                match Self::parse_v2ray_domains(domains_data) {
                                     Ok(parsed) => {
                                         all_domains.extend(parsed);
                                     }
@@ -771,8 +917,7 @@ impl GeoSiteManager {
                                   domain_count = matchers.len(),
                                   attr_filter = ?attr_filter,
                                   "loaded GeoSite tag with domains");
-                            self.database.insert(store_tag.clone(), matchers);
-                            loaded_count += 1;
+                            parsed.push((store_tag.clone(), matchers));
                         } else {
                             warn!(target = "geosite", tag = %store_tag,
                                   attr_filter = ?attr_filter,
@@ -789,12 +934,12 @@ impl GeoSiteManager {
 
         info!(
             target = "geosite",
-            loaded_count = loaded_count,
+            loaded_count = parsed.len(),
             requested_count = tags.len(),
             "selectively loaded GeoSite data from .dat file"
         );
 
-        Ok(loaded_count)
+        Ok(parsed)
     }
 
     /// 解析 .dat 格式的域名列表 / Parse domain list in .dat format
@@ -869,10 +1014,7 @@ impl GeoSiteManager {
     /// Each Domain message contains: type (field 1, varint) and value (field 2, string)
     /// Returns (DomainMatcher, attribute_keys) pairs — attribute keys enable `@attr` filtering
     #[allow(clippy::regex_creation_in_loops)]
-    fn parse_v2ray_domains(
-        &self,
-        data: &[u8],
-    ) -> anyhow::Result<Vec<(DomainMatcher, Vec<String>)>> {
+    fn parse_v2ray_domains(data: &[u8]) -> anyhow::Result<Vec<(DomainMatcher, Vec<String>)>> {
         let mut results = Vec::new();
         let mut pos = 0;
 
@@ -1211,13 +1353,17 @@ fn run_geosite_watcher(
                     // parking_lot::RwLock::write() 返回 guard 直接，不会中毒
                     // parking_lot::RwLock does not have poison state
                     let load_result = if is_dat {
-                        // 加载 .dat 格式 / Load .dat format
-                        let mut guard = manager.write();
+                        // 加载 .dat 格式：先在锁外解析，再短暂持写锁替换，
+                        // 免得整个文件的读取与解析期间匹配请求全部停等。
+                        // Load .dat format: parse outside the lock and hold the
+                        // write lock only for the swap, so matching requests do
+                        // not stall for the whole read and parse.
                         if tags.is_empty() {
-                            guard.load_from_dat_file(&path)
+                            GeoSiteManager::parse_dat_file(&path)
                         } else {
-                            guard.load_from_dat_file_selective(&path, &tags)
+                            GeoSiteManager::parse_dat_file_selective(&path, &tags)
                         }
+                        .map(|parsed| manager.write().apply_source(&path, parsed))
                     } else {
                         // 加载 JSON 格式 / Load JSON format
                         std::fs::read_to_string(&path)
@@ -1327,6 +1473,235 @@ mod tests {
             result.extend(encode_ld(1, entry));
         }
         result
+    }
+
+    fn write_dat(dir: &tempfile::TempDir, entries: &[Vec<u8>]) -> PathBuf {
+        let path = dir.path().join("geosite.dat");
+        std::fs::write(&path, build_dat(entries)).unwrap();
+        path
+    }
+
+    #[test]
+    fn dat_reload_drops_tags_removed_from_the_file() {
+        // The .dat loaders used to insert into the live table without clearing
+        // it, so a tag deleted from the file kept matching after a reload.
+        // .dat 加载器曾直接往现有表里插入而不清空：文件里删掉的 tag 重载后仍然命中。
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_dat(
+            &dir,
+            &[
+                build_geosite("CN", &[build_domain(2, "baidu.com", &[])]),
+                build_geosite("ADS", &[build_domain(2, "doubleclick.net", &[])]),
+            ],
+        );
+        let mut manager = GeoSiteManager::new();
+        manager.load_from_dat_file(&path).unwrap();
+        assert!(manager.matches("ads", "www.doubleclick.net"));
+
+        write_dat(
+            &dir,
+            &[build_geosite("CN", &[build_domain(2, "qq.com", &[])])],
+        );
+        manager.load_from_dat_file(&path).unwrap();
+
+        assert!(
+            !manager.matches("ads", "www.doubleclick.net"),
+            "a tag removed from the file must stop matching"
+        );
+        assert!(!manager.matches("cn", "www.baidu.com"));
+        assert!(manager.matches("cn", "www.qq.com"));
+    }
+
+    #[test]
+    fn corrupt_dat_reload_keeps_previous_data_intact() {
+        // A file that fails to parse must leave the previous data untouched:
+        // no entries from the bad file, nothing from the old data lost.
+        // 解析失败的文件不能动现有数据：坏文件里的条目一个都不进来，旧数据一个都不丢。
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_dat(
+            &dir,
+            &[build_geosite("OLD", &[build_domain(2, "old.example", &[])])],
+        );
+        let mut manager = GeoSiteManager::new();
+        manager.load_from_dat_file(&path).unwrap();
+
+        // One good entry followed by an unterminated varint.
+        let mut corrupt =
+            build_dat(&[build_geosite("NEW", &[build_domain(2, "new.example", &[])])]);
+        corrupt.extend_from_slice(&[0x0A, 0xFF]);
+        std::fs::write(&path, corrupt).unwrap();
+
+        manager
+            .load_from_dat_file(&path)
+            .expect_err("corrupt file must be rejected");
+        assert!(
+            manager.matches("old", "www.old.example"),
+            "previous data must survive a failed reload"
+        );
+        assert!(
+            !manager.matches("new", "www.new.example"),
+            "nothing from the failed file may leak into the live table"
+        );
+    }
+
+    /// 配置里写相对路径、监视器事件给绝对路径，两者必须指向同一条记录，
+    /// 否则删除动作永远打不中启动时那次加载。
+    /// A relative path from the configuration and the absolute path a watcher
+    /// event carries must refer to the same entry, or the removal never matches
+    /// the load that happened at startup.
+    #[test]
+    fn dat_reload_matches_the_same_file_through_a_different_path_spelling() {
+        let dir = tempfile::tempdir().unwrap();
+        let absolute = write_dat(
+            &dir,
+            &[
+                build_geosite("CN", &[build_domain(2, "baidu.com", &[])]),
+                build_geosite("ADS", &[build_domain(2, "doubleclick.net", &[])]),
+            ],
+        );
+        // 同一个文件的另一种写法：绕一层子目录再退回来。Rust 的 Path 比较会规范化
+        // 掉 "."，但不会规范化 ".."，正好模拟配置里的相对路径与监视器给出的绝对
+        // 路径指向同一个文件却不相等的情况。
+        // Another spelling of the same file, via a subdirectory and back. Rust's
+        // Path comparison normalises "." away but not "..", which reproduces a
+        // relative path from the configuration and the absolute path a watcher
+        // reports pointing at one file without comparing equal.
+        std::fs::create_dir(dir.path().join("sub")).unwrap();
+        let indirect = dir.path().join("sub").join("..").join("geosite.dat");
+
+        let mut manager = GeoSiteManager::new();
+        manager.load_from_dat_file(&indirect).unwrap();
+        assert!(manager.matches("ads", "www.doubleclick.net"));
+
+        write_dat(
+            &dir,
+            &[build_geosite("CN", &[build_domain(2, "qq.com", &[])])],
+        );
+        manager.load_from_dat_file(&absolute).unwrap();
+
+        assert!(
+            !manager.matches("ads", "www.doubleclick.net"),
+            "the same file under another spelling must count as the same source"
+        );
+        assert!(manager.matches("cn", "www.qq.com"));
+    }
+
+    /// 两个文件都声明同一个 tag 时，重载其中一个不能把另一个的数据带走。
+    /// When two files declare the same tag, reloading one must not take the
+    /// other file's data with it.
+    #[test]
+    fn reloading_one_file_keeps_a_tag_another_file_still_provides() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a.dat");
+        let b = dir.path().join("b.dat");
+        std::fs::write(
+            &a,
+            build_dat(&[
+                build_geosite("ADS", &[build_domain(2, "doubleclick.net", &[])]),
+                build_geosite("ONLY-A", &[build_domain(2, "only-a.example", &[])]),
+            ]),
+        )
+        .unwrap();
+        std::fs::write(
+            &b,
+            build_dat(&[build_geosite("ADS", &[build_domain(2, "ads.example", &[])])]),
+        )
+        .unwrap();
+
+        let mut manager = GeoSiteManager::new();
+        manager.load_from_dat_file(&a).unwrap();
+        manager.load_from_dat_file(&b).unwrap();
+
+        // a.dat 去掉 ads，b.dat 原封不动 / ads leaves a.dat, b.dat is untouched
+        std::fs::write(
+            &a,
+            build_dat(&[build_geosite(
+                "ONLY-A",
+                &[build_domain(2, "only-a.example", &[])],
+            )]),
+        )
+        .unwrap();
+        manager.load_from_dat_file(&a).unwrap();
+
+        assert!(
+            manager.has_tag("ads"),
+            "a tag another file still provides must survive"
+        );
+        assert!(manager.matches("only-a", "www.only-a.example"));
+    }
+
+    /// 后加载的文件删掉共享 tag 之后，索引里必须换成仍在声明它的那个文件的数据，
+    /// 而不是留着被删掉的那份。
+    /// When the file that loaded last drops a shared tag, the index must fall
+    /// back to the data of the file still declaring it instead of keeping the
+    /// entries that were just deleted.
+    #[test]
+    fn dropping_a_shared_tag_falls_back_to_the_file_still_providing_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a.dat");
+        let b = dir.path().join("b.dat");
+        std::fs::write(
+            &a,
+            build_dat(&[build_geosite(
+                "ADS",
+                &[build_domain(2, "doubleclick.net", &[])],
+            )]),
+        )
+        .unwrap();
+        std::fs::write(
+            &b,
+            build_dat(&[build_geosite("ADS", &[build_domain(2, "ads.example", &[])])]),
+        )
+        .unwrap();
+
+        let mut manager = GeoSiteManager::new();
+        manager.load_from_dat_file(&a).unwrap();
+        // b.dat 后加载，此刻 ads 命中的是 b.dat 的数据
+        // b.dat loads last, so ads matches b.dat's data at this point
+        manager.load_from_dat_file(&b).unwrap();
+        assert!(manager.matches("ads", "www.ads.example"));
+
+        // b.dat 去掉 ads，只剩 a.dat 在提供 / ads leaves b.dat, only a.dat provides it
+        std::fs::write(&b, build_dat(&[])).unwrap();
+        manager.load_from_dat_file(&b).unwrap();
+
+        assert!(
+            manager.matches("ads", "www.doubleclick.net"),
+            "the remaining file's data must be the one serving the tag"
+        );
+        assert!(
+            !manager.matches("ads", "www.ads.example"),
+            "entries from the file that dropped the tag must not survive"
+        );
+    }
+
+    /// 截断的文件（写入中断）必须整份拒绝，而不是把读到的部分当成完整版本。
+    /// A truncated file must be rejected outright rather than taken as complete.
+    #[test]
+    fn truncated_dat_is_rejected_instead_of_dropping_the_rest() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_dat(
+            &dir,
+            &[
+                build_geosite("CN", &[build_domain(2, "baidu.com", &[])]),
+                build_geosite("ADS", &[build_domain(2, "doubleclick.net", &[])]),
+            ],
+        );
+        let mut manager = GeoSiteManager::new();
+        manager.load_from_dat_file(&path).unwrap();
+
+        // 只写出前半段，模拟覆盖写到一半 / Write only the first half
+        let full = std::fs::read(&path).unwrap();
+        std::fs::write(&path, &full[..full.len() * 2 / 3]).unwrap();
+        manager
+            .load_from_dat_file(&path)
+            .expect_err("a truncated file must be rejected");
+
+        assert!(
+            manager.matches("ads", "www.doubleclick.net"),
+            "a rejected file must leave the previous data in place"
+        );
+        assert!(manager.matches("cn", "www.baidu.com"));
     }
 
     #[test]
