@@ -252,15 +252,6 @@ impl Engine {
         (total, failures, rate)
     }
 
-    /// Mark TCP external timeout for a specific upstream
-    /// 标记特定上游的 TCP 外部超时
-    ///
-    /// 当 TCP worker 发生外部超时时调用此方法，记录错误并可能触发连接重置
-    /// Call this method when TCP worker external timeout occurs, recording errors and possibly triggering connection reset
-    pub fn mark_tcp_timeout(&self, upstream: &str) {
-        self.tcp_mux.mark_timeout(upstream);
-    }
-
     /// Increment total_requests counter using simple atomic operation
     #[inline]
     fn incr_total_requests(&self) {
@@ -2946,6 +2937,39 @@ mod tests {
         assert!(
             engine.cache.get(&dedupe_hash).is_none(),
             "Cache entry should be removed after expiration check"
+        );
+    }
+
+    /// flow_control_initial_permits 曾在构造 Engine 时被下一行的天花板当场覆盖，
+    /// 配置项完全不生效：开了流控的部署从天花板起步，而不是文档写的初始值。
+    /// flow_control_initial_permits used to be overwritten by the ceiling on the
+    /// very next line when the Engine was built, so the setting never applied and
+    /// a flow-controlled deployment started at the ceiling instead of the
+    /// documented initial value.
+    #[tokio::test]
+    async fn flow_control_starts_at_the_configured_initial_permits() {
+        let engine = Engine::new(
+            RuntimePipelineConfig {
+                settings: GlobalSettings {
+                    default_upstream: TEST_UPSTREAM.to_string(),
+                    flow_control_enabled: true,
+                    flow_control_min_permits: 100,
+                    flow_control_initial_permits: 500,
+                    flow_control_max_permits: 800,
+                    ..Default::default()
+                },
+                pipeline_select: Vec::new(),
+                pipelines: Vec::new(),
+                pipeline_id_index: FxHashMap::default(),
+            },
+            "lbl".to_string(),
+        )
+        .expect("initialize engine");
+
+        assert_eq!(
+            engine.permit_manager.max_permits(),
+            500,
+            "the current limit must start at flow_control_initial_permits, not the ceiling"
         );
     }
 

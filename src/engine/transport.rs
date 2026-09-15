@@ -15,7 +15,7 @@ use rustls::{ClientConfig, RootCertStore};
 use socket2::{Domain, Protocol, SockRef, Socket, TcpKeepalive, Type};
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU16, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{
@@ -543,58 +543,15 @@ impl TcpMultiplexer {
         let idx = pool.next_idx.fetch_add(1, Ordering::Relaxed) % pool.clients.len();
         pool.clients[idx].send(packet, timeout_dur).await
     }
-
-    /// Record external timeout, incrementing error counters for all connections of the upstream
-    /// 记录外部超时，增加该上游所有连接的错误计数
-    ///
-    /// # Design / 设计
-    ///
-    /// This method is called from sync context when TCP worker external timeout occurs.
-    /// Since we cannot identify which specific connection had the timeout, we increment
-    /// the error counter for all connections in the pool. The actual connection reset
-    /// will be triggered on the next use via `record_error()` or `check_connection_health()`.
-    ///
-    /// 此方法在 TCP worker 外部超时时从同步上下文调用。
-    /// 由于无法确定是哪个连接超时，我们对池中所有连接增加错误计数。
-    /// 实际的连接重置会在下次使用时通过 `record_error()` 或 `check_connection_health()` 触发。
-    ///
-    /// # Thread Safety / 线程安全
-    ///
-    /// The health threshold is only set once during initialization and never modified
-    /// at runtime, so reading it once per loop iteration is safe.
-    ///
-    /// 健康检查阈值仅在初始化时设置一次，运行时不会修改，因此每次循环读取一次是安全的。
-    pub(crate) fn mark_timeout(&self, upstream: &str) {
-        if let Some(pool) = self.pools.get(upstream) {
-            // Record errors for all connections (since we don't know which specific one timed out)
-            // 对所有连接记录错误（因为我们不知道具体是哪个超时）
-            for client in &pool.clients {
-                // Read threshold once: safe because it's only set during initialization
-                // 读取一次阈值：安全，因为它仅在初始化时设置
-                let threshold = client.health_threshold.load(Ordering::Acquire);
-                let errors = client.consecutive_errors.fetch_add(1, Ordering::Release) + 1;
-
-                if threshold > 0 && errors >= threshold {
-                    warn!(
-                        upstream = %client.upstream,
-                        consecutive_errors = errors,
-                        threshold = threshold,
-                        "TCP external timeout threshold exceeded, connection will be reset on next use"
-                    );
-                    // Note: Cannot call async reset_conn here. The error count has been recorded,
-                    // and the connection will be reset on the next send() call via record_error().
-                    // 注意：这里无法调用 async reset_conn。错误计数已记录，
-                    // 连接会在下次 send() 调用时通过 record_error() 重置。
-                }
-            }
-        }
-    }
 }
 
 pub struct TcpMuxClient {
     pub upstream: Arc<str>,
     /// Write half protected by Mutex - serves as both connection storage and write serialization
     conn: Arc<Mutex<Option<OwnedWriteHalf>>>,
+    /// 上一次写入被取消，下次使用前需要完整 reset
+    /// A write was cancelled; the connection needs a full reset before reuse
+    write_cancelled: AtomicBool,
     pending: Arc<dashmap::DashMap<u16, Pending, FxBuildHasher>>,
     next_id: AtomicU16,
     /// Per-upstream permit manager for TCP connection-level control
@@ -641,11 +598,63 @@ impl Drop for TcpPendingGuard {
     }
 }
 
+/// 写入期间被取消时丢弃这条连接
+/// Drops the connection if the write is cancelled part way through
+///
+/// 与 [`TcpPendingGuard`] 是同一个取消点：`send_attempt` 可以在任意 await 处
+/// 被丢弃——外层请求超时先到（`validate_timeouts` 只要求 request >= upstream，
+/// 取等时就会），或者双发路径上 UDP 先返回导致 `tcp_task.abort()`。待处理表
+/// 那一侧已经由 `TcpPendingGuard` 兜住，写入这一侧此前没有：`write_all` 只写
+/// 进去一部分就被丢弃时，连接仍然留在池里，下一个请求把自己的帧接在半条帧
+/// 后面，对端按长度前缀读就会错位，而且不计错误也不重置，只能等下一次失败
+/// 才自愈。
+///
+/// 这里把连接置空即可，下一次 `ensure_connection` 会重建。代价是热路径上多
+/// 一次栈上构造和一次布尔写。
+///
+/// The same cancellation point as [`TcpPendingGuard`]: `send_attempt` can be
+/// dropped at any await, either because the outer request timeout fires first
+/// (`validate_timeouts` only requires request >= upstream, so equality allows
+/// it) or because UDP answered first on the dual-send path and aborted the TCP
+/// task. The pending-map side was already covered by `TcpPendingGuard`; the
+/// write side was not. A `write_all` dropped after a partial write leaves the
+/// connection in the pool, the next request appends its frame to half a frame,
+/// and a peer reading by length prefix desynchronises, with nothing counting an
+/// error or resetting it until a later request fails. Clearing the slot is
+/// enough, since the next `ensure_connection` rebuilds it. The hot path pays
+/// one stack construction and one boolean store.
+struct TcpWriteGuard<'a> {
+    slot: &'a mut Option<OwnedWriteHalf>,
+    /// 取消时置位，交给下一次 `ensure_connection` 做完整 reset
+    /// Set on cancellation so the next `ensure_connection` does a full reset
+    needs_reset: &'a AtomicBool,
+    armed: bool,
+}
+
+impl Drop for TcpWriteGuard<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            // 立刻丢掉写半边，半条帧不会再被别人续写；`reset()` 还要取消 reader
+            // 的 token 并释放连接级 permit，那两件事不能在 Drop 里 await，所以
+            // 置位让下一次 `ensure_connection` 顺着既有的 `errors > 0` 那条路
+            // 一起收口。
+            // Drop the write half at once so nothing can append to half a frame.
+            // A full `reset()` also cancels the reader's token and releases the
+            // connection permit, neither of which can await inside Drop, so this
+            // flags the next `ensure_connection` to take the existing
+            // `errors > 0` path and finish the job in one place.
+            *self.slot = None;
+            self.needs_reset.store(true, Ordering::Release);
+        }
+    }
+}
+
 impl TcpMuxClient {
     fn new(upstream: Arc<str>, permit_manager: Arc<PermitManager>) -> Self {
         Self {
             upstream,
             conn: Arc::new(Mutex::new(None)),
+            write_cancelled: AtomicBool::new(false),
             pending: Arc::new(dashmap::DashMap::with_hasher(FxBuildHasher)),
             next_id: AtomicU16::new(1),
             permit_manager,
@@ -997,14 +1006,33 @@ impl TcpMuxClient {
             // Connection must exist (ensure_connection was called earlier)
             // 连接必须存在（ensure_connection 已在之前调用）
             // Pre-flight check: if writer is closed or broken, fail fast
-            let writer = guard.as_mut().context("tcp write half missing")?;
+            if guard.is_none() {
+                anyhow::bail!("tcp write half missing");
+            }
 
             // Note: OwnedWriteHalf doesn't support peek/checking error directly easily without shared socket access.
             // But if the previous read failed, guard should be None (reset).
             // The fact we are here means 'guard' is Some, so we think connection is alive.
             // Writing to a closed socket usually triggers error immediately on Linux/BSD.
 
-            if let Err(e) = writer.write_all(&new_packet).await {
+            // 写入期间被取消时丢弃连接，避免半条帧留在池里 / Drop the connection
+            // if the write is cancelled, so half a frame cannot stay pooled
+            let mut write_guard = TcpWriteGuard {
+                slot: &mut guard,
+                needs_reset: &self.write_cancelled,
+                armed: true,
+            };
+            let writer = write_guard
+                .slot
+                .as_mut()
+                .expect("connection presence checked above");
+            let result = writer.write_all(&new_packet).await;
+            // 走到这里说明写入已经结束：成功则帧是完整的，失败则下面会 reset。
+            // Reaching here means the write finished: complete on success, and
+            // the caller resets on failure.
+            write_guard.armed = false;
+
+            if let Err(e) = result {
                 return Err(anyhow::anyhow!(e).context("tcp write failed"));
             }
             Ok::<(), anyhow::Error>(())
@@ -1125,13 +1153,20 @@ impl TcpMuxClient {
         // First, check if we need to reconnect based on error state
         // 首先，根据错误状态检查是否需要重连
         let errors = self.consecutive_errors.load(Ordering::Acquire);
-        let needs_reset = errors > 0;
+        // 写入被取消过：写半边已经在 Drop 里丢掉了，这里补齐 reader token 与
+        // 连接级 permit，让清理和普通错误路径完全对称。
+        // A cancelled write already dropped the write half in Drop; this picks
+        // up the reader token and the connection permit so the cleanup matches
+        // the ordinary error path exactly.
+        let write_cancelled = self.write_cancelled.swap(false, Ordering::AcqRel);
+        let needs_reset = errors > 0 || write_cancelled;
 
         if needs_reset {
             debug!(
                 upstream = %self.upstream,
                 consecutive_errors = errors,
-                "TCP connection has errors, resetting before ensure"
+                write_cancelled,
+                "TCP connection needs a reset before ensure"
             );
             self.reset().await;
         }
@@ -2447,6 +2482,55 @@ pub struct DoqConnectionPool {
 ///
 /// 参考 RFC 9250 (DNS over Dedicated QUIC Connections) 实现
 /// Implements RFC 9250 (DNS over Dedicated QUIC Connections)
+/// DoQ 一次尝试的失败原因，按类型保留 quinn 的原始错误
+/// Why one DoQ attempt failed, keeping quinn's own error by type
+///
+/// 此前内层每一步都被 `.context()` 包过，而 `anyhow::Error::to_string()` 只
+/// 输出最外层那一句，所以判定 0-RTT 是否被拒绝时拿到的永远只是那几个固定
+/// 短语，quinn 说的话根本到不了。把原始错误原样带出来，判定就能落在类型上。
+/// Every step used to be wrapped in `.context()`, and
+/// `anyhow::Error::to_string()` renders only the outermost one, so the check
+/// for a rejected 0-RTT attempt never saw anything but a handful of fixed
+/// phrases and never quinn's own words. Carrying the error out untouched lets
+/// the decision rest on types.
+#[derive(Debug)]
+enum DoqFailure {
+    /// `open_bi` 失败：连接已经不可用 / the connection is already unusable
+    OpenStream(quinn::ConnectionError),
+    /// 写查询失败 / writing the query failed
+    Write(quinn::WriteError),
+    /// 读应答失败 / reading the answer failed
+    Read(quinn::ReadToEndError),
+    /// 应答本身不合协议，与 0-RTT 无关 / the answer itself is malformed
+    Protocol(String),
+}
+
+impl std::fmt::Display for DoqFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::OpenStream(err) => write!(f, "doq open stream failed: {err}"),
+            Self::Write(err) => write!(f, "doq send query failed: {err}"),
+            Self::Read(err) => write!(f, "doq read response failed: {err}"),
+            Self::Protocol(message) => f.write_str(message),
+        }
+    }
+}
+
+impl std::error::Error for DoqFailure {
+    /// 保住 quinn 的 source 链：类型化到这里就被拍平成字符串的话，日志里就只
+    /// 剩 Display 那一行了。
+    /// Keeps quinn's source chain: flattening to a string at this boundary
+    /// would leave the log with nothing but the Display line.
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::OpenStream(err) => Some(err),
+            Self::Write(err) => Some(err),
+            Self::Read(err) => Some(err),
+            Self::Protocol(_) => None,
+        }
+    }
+}
+
 pub struct DoqClient {
     pools: DashMap<Arc<str>, Arc<DoqConnectionPool>, FxBuildHasher>,
     pool_size: usize,
@@ -2738,8 +2822,14 @@ impl DoqMuxClient {
             // RFC 9250 §4.2: QUIC 流上的 DNS 消息必须使用 2 字节长度前缀，
             // 后跟 DNS 消息内容。每个查询使用单独的双向流；消息边界由 FIN 信号标识。
             let resp = timeout(timeout_dur, async {
-                let (mut send, mut recv) = conn.open_bi().await
-                    .context("doq open stream failed")?;
+                // 内层返回带类型的失败，而不是 anyhow：每一步都被 context 包过
+                // 之后，anyhow 的 to_string 只剩最外层那一句，quinn 的原始错误
+                // 到不了判定处。
+                // The inner block yields a typed failure rather than anyhow:
+                // once every step is wrapped in context, anyhow's to_string
+                // leaves only the outermost sentence and quinn's own error never
+                // reaches the decision.
+                let (mut send, mut recv) = conn.open_bi().await.map_err(DoqFailure::OpenStream)?;
 
                 // RFC 9250 §4.2: DNS messages sent over QUIC streams MUST be prefixed
                 // with a 2-octet length field, followed by the DNS message content.
@@ -2758,7 +2848,7 @@ impl DoqMuxClient {
                 frame[2] = 0; // Message ID = 0 (RFC 9250 §4.2.1) / 消息 ID = 0
                 frame[3] = 0;
 
-                send.write_all(&frame).await.context("doq send query failed")?;
+                send.write_all(&frame).await.map_err(DoqFailure::Write)?;
                 let _ = send.finish();
 
                 // Read response: 2-byte length prefix followed by DNS message
@@ -2767,24 +2857,30 @@ impl DoqMuxClient {
                 // We need to read all data until FIN, then parse the length prefix
                 // 注意：服务器发送响应后用 FIN 关闭流
                 // 我们需要读取所有数据直到 FIN，然后解析长度前缀
-                let mut all_data = match recv.read_to_end(MAX_DNS_MESSAGE_SIZE + 2).await {
-                    Ok(data) => data,
-                    Err(e) => {
-                        // Check if this is a connection closed error
-                        // 检查是否是连接关闭错误
-                        if e.to_string().contains("closed by peer") || e.to_string().contains("connection lost") {
-                            anyhow::bail!("doq connection closed by server (possible protocol error or server does not support DoQ)");
-                        }
-                        return Err(e).context("doq read response failed");
-                    }
-                };
+                // 连接被对端关掉的判断此前靠字符串，而且那个判断把所有原因都
+                // 折叠成同一句话；现在原样把 quinn 的错误带出去，由
+                // zero_rtt_likely_rejected 按类型判定。
+                // Detecting a peer-closed connection used to go through strings,
+                // and that check folded every cause into one sentence. The quinn
+                // error is now carried out as it is and
+                // zero_rtt_likely_rejected decides by type.
+                let mut all_data = recv
+                    .read_to_end(MAX_DNS_MESSAGE_SIZE + 2)
+                    .await
+                    .map_err(DoqFailure::Read)?;
 
                 if all_data.is_empty() {
-                    anyhow::bail!("doq received empty response (server closed stream without sending data)");
+                    return Err(DoqFailure::Protocol(
+                        "doq received empty response (server closed stream without sending data)"
+                            .to_string(),
+                    ));
                 }
 
                 if all_data.len() < 2 {
-                    anyhow::bail!("doq response too short: {} bytes", all_data.len());
+                    return Err(DoqFailure::Protocol(format!(
+                        "doq response too short: {} bytes",
+                        all_data.len()
+                    )));
                 }
 
                 let msg_len = u16::from_be_bytes([all_data[0], all_data[1]]) as usize;
@@ -2792,11 +2888,13 @@ impl DoqMuxClient {
                 // idoq-style length validation: response length must match length prefix
                 // idoq 风格的长度验证：响应长度必须匹配长度前缀
                 if all_data.len() != 2 + msg_len {
-                    anyhow::bail!(
+                    return Err(DoqFailure::Protocol(format!(
                         "doq length mismatch: expected {} bytes (2 + {}), got {} bytes. \
                         This may indicate data corruption or server protocol violation.",
-                        2 + msg_len, msg_len, all_data.len()
-                    );
+                        2 + msg_len,
+                        msg_len,
+                        all_data.len()
+                    )));
                 }
 
                 let buf = &all_data[2..2 + msg_len];
@@ -2805,7 +2903,9 @@ impl DoqMuxClient {
                     // Also prevents all_data[2..4] index out of bounds when msg_len < 2.
                     // DNS 消息必须至少 2 字节才能恢复 TXID。
                     // 同时防止 msg_len < 2 时 all_data[2..4] 越界。
-                    anyhow::bail!("doq DNS message too short: {} bytes", msg_len);
+                    return Err(DoqFailure::Protocol(format!(
+                        "doq DNS message too short: {msg_len} bytes"
+                    )));
                 }
                 // Restore original DNS Message ID in-place (Vec<u8> is mutable).
                 // Bytes::from(Vec) takes ownership of the heap allocation (zero-copy).
@@ -2814,38 +2914,41 @@ impl DoqMuxClient {
                 // Bytes::from(Vec) 接管堆分配（零拷贝）。
                 // slice(2..) 返回跳过长度前缀的视图（零拷贝，共享分配）。
                 all_data[2..4].copy_from_slice(&original_id.to_be_bytes());
-                Ok(Bytes::from(all_data).slice(2..))
-            }).await;
+                Ok::<Bytes, DoqFailure>(Bytes::from(all_data).slice(2..))
+            })
+            .await;
 
             match resp {
                 Ok(Ok(bytes)) => {
                     self.record_success();
                     return Ok(bytes);
                 }
-                Ok(Err(err)) => {
-                    let err_str = err.to_string();
+                Ok(Err(failure)) => {
                     let already_reset = self.record_error().await;
                     if !already_reset {
                         // Only reset if record_error() didn't already reset (below threshold)
                         self.reset_connection().await;
                     }
-                    if allow_retry && used_0rtt && self.should_retry_without_0rtt(target, &err_str)
+                    if allow_retry
+                        && used_0rtt
+                        && self.zero_rtt_retry_allowed(target)
+                        && Self::zero_rtt_likely_rejected(&failure)
                     {
                         self.disable_zero_rtt();
                         let remaining = timeout_dur.saturating_sub(start.elapsed());
                         if remaining.is_zero() {
-                            return Err(err);
+                            return Err(anyhow::Error::new(failure));
                         }
                         warn!(
                             upstream = %self.upstream,
-                            error = %err,
-                            "DoQ 0-RTT likely rejected (connection closed/stream error), retrying without 0-RTT"
+                            error = %failure,
+                            "DoQ 0-RTT likely rejected, retrying without 0-RTT"
                         );
                         allow_retry = false;
                         timeout_dur = remaining;
                         continue;
                     }
-                    return Err(err);
+                    return Err(anyhow::Error::new(failure));
                 }
                 Err(_) => {
                     if allow_retry && used_0rtt {
@@ -2877,9 +2980,14 @@ impl DoqMuxClient {
                             .store(true, std::sync::atomic::Ordering::Relaxed);
                         warn!(
                             upstream = %self.upstream,
+                            // 粘滞位绕不过去：connect_new 用的是
+                            // enable_0rtt && !was_rejected，所以 ?0rtt=true 也
+                            // 不会让它重新启用，只能重启进程。
+                            // The sticky bit cannot be bypassed: connect_new
+                            // takes enable_0rtt && !was_rejected, so ?0rtt=true
+                            // does not re-enable it either; only a restart does.
                             "DoQ 0-RTT timeout detected, automatically disabling 0-RTT for this upstream. \
-                            Future connections will use normal handshake. This status is cached until restart. \
-                            To re-enable 0-RTT, restart the server or use ?0rtt=true in the upstream URL."
+                            Future connections will use normal handshake. This status is cached until a restart."
                         );
                     }
                     let already_reset = self.record_error().await;
@@ -2892,23 +3000,52 @@ impl DoqMuxClient {
         }
     }
 
-    fn should_retry_without_0rtt(&self, target: &DoqTarget, err: &str) -> bool {
-        let enable_0rtt = target.enable_0rtt.unwrap_or(self.runtime.enable_0rtt);
-        if !enable_0rtt {
-            return false;
+    /// 这次失败是否像 0-RTT 被拒绝，值得关掉 0-RTT 再试一次
+    /// Whether this failure looks like a rejected 0-RTT attempt and is worth one
+    /// retry with 0-RTT off
+    ///
+    /// 两类算数：quinn 明确报告 `ZeroRttRejected`；或者连接被对端关闭、重置、
+    /// 丢失——服务器拒绝 0-RTT 数据时常常直接关连接，而不是报那个专门的错误。
+    /// 本地关闭、超时、协议层面的问题都不算，它们和 0-RTT 无关。
+    ///
+    /// 纯函数，不吃 `&self`，所以测试可以直接拿 quinn 的错误值驱动它。
+    /// Two things count: quinn saying `ZeroRttRejected` outright, and the
+    /// connection being closed, reset or lost by the peer, since a server that
+    /// refuses 0-RTT data often just closes instead of raising that specific
+    /// error. A local close, a timeout and any protocol-level problem do not,
+    /// having nothing to do with 0-RTT. It takes no `&self`, so a test can drive
+    /// it with real quinn error values.
+    fn zero_rtt_likely_rejected(failure: &DoqFailure) -> bool {
+        fn peer_ended_it(err: &quinn::ConnectionError) -> bool {
+            matches!(
+                err,
+                quinn::ConnectionError::ApplicationClosed(_)
+                    | quinn::ConnectionError::ConnectionClosed(_)
+                    | quinn::ConnectionError::Reset
+            )
         }
-        if self
-            .zero_rtt_rejected
-            .load(std::sync::atomic::Ordering::Relaxed)
-        {
-            return false;
+
+        match failure {
+            DoqFailure::OpenStream(err) => peer_ended_it(err),
+            DoqFailure::Write(quinn::WriteError::ZeroRttRejected) => true,
+            DoqFailure::Write(quinn::WriteError::ConnectionLost(err)) => peer_ended_it(err),
+            DoqFailure::Read(quinn::ReadToEndError::Read(err)) => match err {
+                quinn::ReadError::ZeroRttRejected => true,
+                quinn::ReadError::ConnectionLost(err) => peer_ended_it(err),
+                _ => false,
+            },
+            _ => false,
         }
-        err.contains("doq connection closed by server")
-            || err.contains("closed by peer")
-            || err.contains("connection lost")
-            || err.contains("stream reset")
-            || err.contains("ConnectionClosed")
-            || err.contains("reset by peer")
+    }
+
+    /// 在这条连接上是否还允许关掉 0-RTT 重试：配置开着、且还没被标记过拒绝
+    /// Whether a 0-RTT retry is still allowed here: enabled by configuration and
+    /// not already marked as rejected
+    fn zero_rtt_retry_allowed(&self, target: &DoqTarget) -> bool {
+        target.enable_0rtt.unwrap_or(self.runtime.enable_0rtt)
+            && !self
+                .zero_rtt_rejected
+                .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     fn disable_zero_rtt(&self) {
@@ -3116,6 +3253,153 @@ fn parse_doq_target(upstream: &str) -> anyhow::Result<DoqTarget> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 0-RTT 判定必须按类型走。此前它比对 `anyhow::Error::to_string()`，而内层
+    /// 每一步都被 `.context()` 包过，那个字符串永远只是三句固定短语之一或一条
+    /// bail 文本，于是 quinn 明说的 `ZeroRttRejected` 从来没有被识别过：判定
+    /// 返回 false，0-RTT 不被禁用，下次连接又用 0-RTT，该上游一直失败到重启。
+    /// The 0-RTT decision has to go by type. It used to compare
+    /// `anyhow::Error::to_string()`, and since every inner step was wrapped in
+    /// `.context()` that string was only ever one of three fixed phrases or a
+    /// bail text, so quinn saying `ZeroRttRejected` outright was never
+    /// recognised: the check returned false, 0-RTT stayed on, the next
+    /// connection used it again and the upstream kept failing until a restart.
+    /// 写入中途被取消时，这条池化连接必须被丢弃。取消点与 TcpPendingGuard
+    /// 兜的是同一个：外层请求超时先到，或者双发路径上 UDP 先返回导致
+    /// tcp_task.abort()。此前只有待处理表那一侧被清理，连接仍然留在池里，
+    /// 下一个请求会把自己的帧接在可能只写了一半的帧后面。
+    /// A pooled connection has to be dropped when the write is cancelled part
+    /// way through. The cancellation point is the one TcpPendingGuard already
+    /// covers: the outer request timeout firing first, or the dual-send path
+    /// aborting the TCP task once UDP answered. Only the pending-map side used
+    /// to be cleaned up, leaving the connection pooled for the next request to
+    /// append its frame to a possibly half-written one.
+    #[tokio::test]
+    async fn a_cancelled_write_drops_the_pooled_connection() {
+        use tokio::io::AsyncWriteExt as _;
+
+        // 对端只 accept 不读，发送缓冲区会被填满，写入因此停在 await 上
+        // The peer accepts and never reads, so the send buffer fills and the
+        // write parks on an await
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let peer = tokio::spawn(async move {
+            let (held, _) = listener.accept().await.unwrap();
+            tokio::time::sleep(Duration::from_secs(30)).await;
+            drop(held);
+        });
+
+        let client = Arc::new(TcpMuxClient::new(
+            Arc::from(addr.to_string().as_str()),
+            Arc::new(PermitManager::new_unlimited()),
+        ));
+
+        // 直接建连，不走查询——查询超时会自己 reset 掉连接
+        // Connect directly: a query would time out and reset the connection
+        let query = [0u8; 12];
+        client
+            .ensure_connection(Duration::from_secs(2))
+            .await
+            .expect("connect to the test peer");
+        assert!(
+            client.conn.lock().await.is_some(),
+            "the connection must be pooled before the test can mean anything"
+        );
+
+        // 把发送缓冲区填满，让后续写入必然停在 await 上
+        // Fill the send buffer so any later write must park on an await
+        {
+            let mut guard = client.conn.lock().await;
+            let writer = guard.as_mut().unwrap();
+            let chunk = vec![0u8; 65536];
+            while tokio::time::timeout(Duration::from_millis(300), writer.write_all(&chunk))
+                .await
+                .is_ok()
+            {}
+        }
+
+        // 写入停在 await 上时取消这次发送
+        // Cancel the send while the write is parked
+        let sender = Arc::clone(&client);
+        let task = tokio::spawn(async move { sender.send(&query, Duration::from_secs(30)).await });
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        task.abort();
+        let _ = task.await;
+
+        assert!(
+            client.conn.lock().await.is_none(),
+            "a write cancelled part way through must drop the connection instead of \
+             leaving a possibly half-written frame in the pool"
+        );
+        assert!(
+            client.write_cancelled.load(Ordering::Acquire),
+            "the next ensure_connection must be told to finish the cleanup that \
+             Drop cannot await: the reader token and the connection permit"
+        );
+
+        // 下一次建连要真的走完整 reset，并把标志清掉
+        // The next connect must take the full reset path and clear the flag
+        client
+            .ensure_connection(Duration::from_secs(2))
+            .await
+            .expect("reconnect after a cancelled write");
+        assert!(
+            !client.write_cancelled.load(Ordering::Acquire),
+            "the flag must be consumed, not left to reset a healthy connection later"
+        );
+
+        peer.abort();
+    }
+
+    #[test]
+    fn doq_zero_rtt_rejection_is_classified_by_type() {
+        use quinn::{ConnectionError, ReadError, ReadToEndError, WriteError};
+
+        // quinn 明说被拒绝 / quinn says so outright
+        assert!(DoqMuxClient::zero_rtt_likely_rejected(&DoqFailure::Write(
+            WriteError::ZeroRttRejected
+        )));
+        assert!(DoqMuxClient::zero_rtt_likely_rejected(&DoqFailure::Read(
+            ReadToEndError::Read(ReadError::ZeroRttRejected)
+        )));
+
+        // 对端直接关掉连接：拒绝 0-RTT 数据的服务器常常这样做
+        // The peer just closes: what a server refusing 0-RTT data often does
+        let closed = || {
+            ConnectionError::ApplicationClosed(quinn::ApplicationClose {
+                error_code: quinn::VarInt::from_u32(0),
+                reason: bytes::Bytes::new(),
+            })
+        };
+        assert!(DoqMuxClient::zero_rtt_likely_rejected(
+            &DoqFailure::OpenStream(closed())
+        ));
+        assert!(DoqMuxClient::zero_rtt_likely_rejected(&DoqFailure::Read(
+            ReadToEndError::Read(ReadError::ConnectionLost(closed()))
+        )));
+        assert!(DoqMuxClient::zero_rtt_likely_rejected(&DoqFailure::Write(
+            WriteError::ConnectionLost(ConnectionError::Reset)
+        )));
+
+        // 与 0-RTT 无关的失败不该触发重试
+        // Failures that have nothing to do with 0-RTT must not trigger a retry
+        assert!(!DoqMuxClient::zero_rtt_likely_rejected(
+            &DoqFailure::OpenStream(ConnectionError::TimedOut)
+        ));
+        assert!(!DoqMuxClient::zero_rtt_likely_rejected(
+            &DoqFailure::OpenStream(ConnectionError::LocallyClosed)
+        ));
+        assert!(!DoqMuxClient::zero_rtt_likely_rejected(&DoqFailure::Read(
+            ReadToEndError::TooLong
+        )));
+        assert!(!DoqMuxClient::zero_rtt_likely_rejected(&DoqFailure::Read(
+            ReadToEndError::Read(ReadError::ClosedStream)
+        )));
+        assert!(!DoqMuxClient::zero_rtt_likely_rejected(
+            &DoqFailure::Protocol("doq response too short: 1 bytes".to_string())
+        ));
+    }
+
     use futures::future::join_all;
     use std::time::Duration;
     use tokio::time::timeout;
